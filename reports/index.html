@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>POPS global structural report</title>
+<style>
+:root {
+  color-scheme: light;
+  --ink: #101828;
+  --muted: #475467;
+  --subtle: #667085;
+  --line: #d0d5dd;
+  --line-soft: #eaecf0;
+  --surface: #ffffff;
+  --canvas: #f6f8fb;
+  --accent: #175cd3;
+  --accent-soft: #eff8ff;
+  --ok: #067647;
+  --ok-soft: #ecfdf3;
+  --error: #b42318;
+  --error-soft: #fee4e2;
+  --warn: #b54708;
+  --warn-soft: #fffaeb;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .06);
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; max-width: 100%; overflow-x: clip; }
+body {
+  margin: 0;
+  max-width: 100%;
+  overflow-x: clip;
+  color: var(--ink);
+  background: var(--canvas);
+  font: 16px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+a { color: var(--accent); text-underline-offset: .16em; }
+a:hover { text-decoration-thickness: 2px; }
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible,
+summary:focus-visible, [tabindex]:focus-visible {
+  outline: 3px solid rgba(23, 92, 211, .35);
+  outline-offset: 2px;
+}
+.skip-link {
+  position: fixed; z-index: 100; top: .5rem; left: .5rem;
+  padding: .65rem .9rem; color: #fff; background: var(--ink);
+  transform: translateY(-160%);
+}
+.skip-link:focus { transform: translateY(0); }
+.topbar { color: #fff; background: #102a56; border-bottom: 4px solid #2e90fa; }
+.topbar__inner, .page, .footer__inner {
+  width: min(1440px, calc(100% - 2rem)); margin-inline: auto;
+}
+.topbar__inner { padding: 1.05rem 0; }
+.brand { margin: 0; font-size: .82rem; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+.breadcrumbs, .report-nav { display: flex; flex-wrap: wrap; gap: .45rem .8rem; align-items: center; }
+.breadcrumbs { margin-top: .4rem; color: #d1e9ff; font-size: .9rem; }
+.breadcrumbs a { color: #fff; }
+.page { padding: 2rem 0 3.5rem; }
+.hero { display: flex; gap: 1.25rem; justify-content: space-between; align-items: flex-start; margin-bottom: 1.5rem; }
+.hero h1 { margin: 0 0 .35rem; font-size: clamp(1.75rem, 4vw, 2.55rem); line-height: 1.15; letter-spacing: -.025em; }
+.eyebrow { margin: 0 0 .45rem; color: var(--accent); font-size: .78rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.lede { max-width: 78ch; margin: 0; color: var(--muted); }
+.hero__status { display: flex; flex-wrap: wrap; gap: .5rem; justify-content: flex-end; }
+.section { margin-top: 2rem; scroll-margin-top: 1rem; }
+.section__heading { display: flex; flex-wrap: wrap; gap: .75rem; justify-content: space-between; align-items: baseline; margin-bottom: .8rem; }
+.section h2 { margin: 0; font-size: 1.3rem; }
+.section h3 { margin: 0; font-size: 1.05rem; }
+.section-intro { max-width: 90ch; margin: .2rem 0 1rem; color: var(--muted); }
+.grid { display: grid; gap: 1rem; }
+.kpi-grid { grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); }
+.two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.card {
+  min-width: 0; padding: 1rem; background: var(--surface); border: 1px solid var(--line-soft);
+  border-radius: .65rem; box-shadow: var(--shadow);
+}
+.kpi { border-top: 3px solid #98a2b3; }
+.kpi--ok { border-top-color: var(--ok); }
+.kpi--error { border-top-color: var(--error); }
+.kpi--accent { border-top-color: var(--accent); }
+.kpi__label { color: var(--muted); font-size: .82rem; font-weight: 700; text-transform: uppercase; letter-spacing: .035em; }
+.kpi__value { margin-top: .22rem; font-size: 1.65rem; font-weight: 780; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.kpi__help { margin-top: .32rem; color: var(--subtle); font-size: .82rem; }
+.badge {
+  display: inline-flex; gap: .34rem; align-items: center; width: fit-content;
+  padding: .2rem .55rem; border: 1px solid currentColor; border-radius: 999px;
+  font-size: .75rem; font-weight: 800; letter-spacing: .025em; line-height: 1.4; white-space: nowrap;
+}
+.badge--ok { color: var(--ok); background: var(--ok-soft); }
+.badge--error, .badge--high { color: var(--error); background: var(--error-soft); }
+.badge--warn { color: var(--warn); background: var(--warn-soft); }
+.badge--info { color: #175cd3; background: var(--accent-soft); }
+.badge--neutral { color: #344054; background: #f2f4f7; }
+.notice { padding: .9rem 1rem; border: 1px solid var(--line); border-left-width: 5px; border-radius: .45rem; background: var(--surface); }
+.notice + .notice { margin-top: .65rem; }
+.notice--error { border-left-color: var(--error); background: #fff8f7; }
+.notice--warn { border-left-color: var(--warn); background: #fffdf5; }
+.notice--ok { border-left-color: var(--ok); background: #f6fef9; }
+.notice--info { border-left-color: var(--accent); background: #f7fbff; }
+.notice__title { margin: 0 0 .25rem; font-weight: 780; }
+.notice p, .notice ul { margin-top: .3rem; margin-bottom: 0; }
+.toolbar {
+  display: grid; grid-template-columns: minmax(220px, 2fr) minmax(180px, 1fr) auto;
+  gap: .75rem; align-items: end; margin: 1rem 0;
+}
+.field label { display: block; margin-bottom: .3rem; color: var(--muted); font-size: .84rem; font-weight: 700; }
+.field input, .field select {
+  width: 100%; min-height: 2.65rem; padding: .55rem .7rem; color: var(--ink); background: #fff;
+  border: 1px solid #98a2b3; border-radius: .4rem; font: inherit;
+}
+.filter-count { min-height: 2.65rem; display: flex; align-items: center; color: var(--muted); font-variant-numeric: tabular-nums; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: .55rem; background: #fff; box-shadow: var(--shadow); }
+table { width: 100%; border-collapse: collapse; }
+caption { padding: .75rem 1rem; color: var(--muted); font-size: .86rem; text-align: left; }
+th, td { padding: .72rem .8rem; border-top: 1px solid var(--line-soft); text-align: left; vertical-align: top; }
+thead th { color: #344054; background: #f9fafb; border-top: 0; font-size: .78rem; letter-spacing: .025em; text-transform: uppercase; }
+tbody th { font-weight: 700; }
+tbody tr:hover { background: #fcfcfd; }
+.global-table { min-width: 1080px; }
+.sheet-table { min-width: 1280px; }
+.cell-title { font-weight: 700; }
+.cell-meta, .muted { color: var(--subtle); font-size: .84rem; }
+.cell-meta { margin-top: .18rem; }
+.number { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.delta { display: block; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.delta--changed { color: var(--error); font-weight: 700; }
+.button-link {
+  display: inline-flex; min-height: 2.35rem; align-items: center; justify-content: center;
+  padding: .45rem .75rem; border: 1px solid #84adff; border-radius: .4rem;
+  color: #1849a9; background: #f5f8ff; font-weight: 700; text-decoration: none;
+}
+.report-nav { margin: 0 0 1rem; }
+.report-nav__spacer { flex: 1; }
+.progress-card label { display: block; margin-bottom: .45rem; font-weight: 700; }
+progress { width: 100%; height: .75rem; accent-color: var(--accent); }
+.progress-card__text { margin: .45rem 0 0; color: var(--muted); }
+.finding-group + .finding-group { margin-top: 1.25rem; }
+.finding-group__title { padding-bottom: .45rem; border-bottom: 1px solid var(--line); }
+.finding-list { display: grid; gap: .7rem; margin-top: .7rem; }
+.finding { border-left: 5px solid var(--error); }
+.finding__top { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; }
+.finding__title { margin-right: auto; font-size: 1rem; }
+.finding__message { margin: .7rem 0; }
+.mini-dl, .audit-dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .25rem .8rem; margin: .5rem 0 0; }
+.mini-dl dt, .audit-dl dt { color: var(--muted); font-weight: 650; }
+.mini-dl dd, .audit-dl dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.evidence-list, .notes-list { margin: .45rem 0 0; padding-left: 1.2rem; }
+details { margin-top: .55rem; }
+summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700; }
+.operation-list { margin: .35rem 0 0; padding-left: 1.05rem; }
+.operation-list li + li { margin-top: .25rem; }
+.source-card h3 { margin-bottom: .65rem; }
+.hash { font: .78rem/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+.method-list { max-width: 95ch; margin: .5rem 0 0; padding-left: 1.25rem; }
+.method-list li + li { margin-top: .45rem; }
+.footer { border-top: 1px solid var(--line); color: var(--muted); background: #fff; }
+.footer__inner { padding: 1.1rem 0; font-size: .84rem; }
+.print-only { display: none; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+[hidden] { display: none !important; }
+@media (max-width: 760px) {
+  .topbar__inner, .page, .footer__inner { width: min(100% - 1rem, 1440px); }
+  .page { padding-top: 1.25rem; }
+  .hero { display: block; }
+  .hero__status { justify-content: flex-start; margin-top: .8rem; }
+  .two-col, .toolbar { grid-template-columns: 1fr; }
+  .filter-count { min-height: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}
+@media print {
+  @page { size: A4 landscape; margin: 11mm; }
+  :root { --canvas: #fff; --shadow: none; }
+  body { font-size: 9pt; background: #fff; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+  .screen-only, .skip-link, .toolbar { display: none !important; }
+  .print-only { display: block; }
+  .page, .topbar__inner, .footer__inner { width: 100%; }
+  .page { padding: 1rem 0; }
+  .topbar { color: #000; background: #fff; border-bottom: 2px solid #000; }
+  .breadcrumbs { color: #333; }
+  .breadcrumbs a { color: #000; }
+  .card, .table-wrap { box-shadow: none; }
+  .table-wrap { overflow: visible; }
+  .global-table, .sheet-table { min-width: 0; }
+  thead { display: table-header-group; }
+  tr, .card, .finding, .notice, .source-card { break-inside: avoid; }
+  .section { break-inside: auto; }
+  .badge { color: #000 !important; background: #fff !important; border: 1.5px solid #000; }
+  details:not([open]) > *:not(summary) { display: block !important; }
+  summary { list-style: none; }
+  summary::-webkit-details-marker { display: none; }
+  a { color: #000; text-decoration: underline; }
+}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+
+<header class="topbar">
+  <div class="topbar__inner">
+    <p class="brand">POPS anomaly detection</p>
+    <nav class="breadcrumbs" aria-label="Breadcrumb"><span aria-current="page">Global report</span></nav>
+  </div>
+</header>
+<main id="main-content" class="page">
+  <div class="hero">
+    <div>
+      <p class="eyebrow">Structural integrity</p>
+      <h1>POPS global report</h1>
+      <p class="lede">Comparison of 0 sent and 0 received workbooks. This run evaluates sheets, rows, columns; values, formula correctness, and visual formatting are outside the current anomaly scope.</p>
+    </div>
+    <div class="hero__status" aria-label="Run status">
+      <span class="badge badge--ok"><span aria-hidden="true">✓</span>OK</span>
+      <span class="badge badge--neutral">No anomaly severity</span>
+    </div>
+  </div>
+  <aside class="notice notice--warn"><p class="notice__title">Run notes</p><ul><li>No .xlsx files were found in either input directory.</li></ul></aside>
+  <section class="section" aria-labelledby="overview-heading">
+    <div class="section__heading"><h2 id="overview-heading">Run overview</h2><a href="report.json">Download report JSON</a></div>
+    <div class="grid kpi-grid">
+      <article class="card kpi kpi--accent"><div class="kpi__label">Sent files</div><div class="kpi__value">0</div><div class="kpi__help">Expected country workbooks</div></article>
+      <article class="card kpi kpi--accent"><div class="kpi__label">Received files</div><div class="kpi__value">0</div><div class="kpi__help">Returned country workbooks</div></article>
+      <article class="card kpi kpi--accent"><div class="kpi__label">Matched pairs</div><div class="kpi__value">0</div><div class="kpi__help">Same filename on both sides</div></article>
+      <article class="card kpi kpi--ok"><div class="kpi__label">OK</div><div class="kpi__value">0</div><div class="kpi__help">Of 0 matched comparisons</div></article>
+      <article class="card kpi"><div class="kpi__label">ERROR</div><div class="kpi__value">0</div><div class="kpi__help">All structural and delivery errors</div></article>
+      <article class="card kpi"><div class="kpi__label">HIGH findings</div><div class="kpi__value">0</div><div class="kpi__help">Across 0 countries</div></article>
+    </div>
+  </section>
+  <section class="section" aria-labelledby="coverage-heading">
+    <div class="section__heading"><h2 id="coverage-heading">Coverage and comparison quality</h2></div>
+    <div class="grid two-col">
+      <article class="card progress-card">
+        <label for="coverage-progress">Matched sent workbooks</label>
+        <progress id="coverage-progress" max="1" value="0">0 of 0</progress>
+        <p class="progress-card__text"><strong>0 of 0</strong> sent workbooks matched; 0 missing received and 0 unexpected received.</p>
+      </article>
+      <article class="card progress-card">
+        <label for="quality-progress">Matched workbooks with OK result</label>
+        <progress id="quality-progress" max="1" value="0">0 of 0</progress>
+        <p class="progress-card__text"><strong>0 of 0</strong> matched comparisons are OK; 0 comparisons require attention because reading or structural mapping failed.</p>
+      </article>
+    </div>
+  </section>
+  <section class="section" aria-labelledby="rollup-heading">
+    <div class="section__heading"><h2 id="rollup-heading">Structural anomalies</h2><span class="badge badge--high"><span aria-hidden="true">!!</span>HIGH</span></div>
+    <p class="section-intro">Added and deleted units are counted independently. A workbook can therefore have a zero net dimension change and still contain HIGH structural anomalies.</p>
+    <div class="notice notice--ok"><p class="notice__title">No structural findings</p><p>No HIGH structural anomalies were detected in the comparable workbooks.</p></div>
+  </section>
+  <section class="section" aria-labelledby="countries-heading">
+    <div class="section__heading"><h2 id="countries-heading">Country results</h2></div>
+    <div class="toolbar screen-only" role="search" aria-label="Filter country results">
+      <div class="field"><label for="country-search">Search country or filename</label><input id="country-search" type="search" autocomplete="off" placeholder="Start typing…"></div>
+      <div class="field"><label for="result-filter">Result or comparison state</label><select id="result-filter"><option value="ALL">All results</option><option value="OK">OK</option><option value="ERROR">ERROR</option><option value="MISSING_RECEIVED">Missing received</option><option value="UNEXPECTED_RECEIVED">Unexpected received</option><option value="READ_ERROR">Read error</option></select></div>
+      <div id="filter-count" class="filter-count" role="status" aria-live="polite">0 results shown</div>
+    </div>
+    <noscript><p class="notice notice--info">Search and filters require JavaScript. All results remain visible below.</p></noscript>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Country comparison results">
+      <table id="country-results" class="global-table">
+        <caption>One row per matched, missing, unexpected, or unreadable country workbook.</caption>
+        <thead><tr><th scope="col">Country / files</th><th scope="col">Result</th><th scope="col">HIGH findings</th><th scope="col">Sheets sent → received</th><th scope="col">Row operations</th><th scope="col">Column operations</th><th scope="col">Affected sheets</th><th scope="col"><span class="sr-only">Report link</span></th></tr></thead>
+        <tbody><tr><td colspan="8">No workbook files were discovered.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+  <section class="section" aria-labelledby="method-heading">
+    <div class="section__heading"><h2 id="method-heading">Methodology and limitations</h2></div>
+    <div class="card">
+      <ul class="method-list">
+        <li>Sheet identity is matched by exact Excel sheet name. A rename is reported conservatively as one deleted sheet and one added sheet.</li>
+        <li>Active worksheet extents are derived from stored cells and structural evidence such as row or column properties, ranges, tables, and drawing anchors. Excel's declared dimension is retained as diagnostic evidence rather than trusted on its own.</li>
+        <li>Inserted and deleted rows and columns are inferred by aligning structural signatures. Ambiguous mappings are surfaced as a HIGH manual-review finding instead of being silently treated as unchanged.</li>
+        <li>Operation counts, not net deltas, determine structural status. Equal additions and deletions may leave the same final dimensions.</li>
+        <li>This report does not yet decide whether values, formulas, styles, charts, or business logic are correct.</li>
+      </ul>
+    </div>
+  </section>
+  <section class="section" aria-labelledby="audit-heading">
+    <div class="section__heading"><h2 id="audit-heading">Run evidence</h2></div>
+    <div class="card"><dl class="audit-dl"><dt>Run ID</dt><dd><code>20260817T095700Z</code></dd><dt>Generated</dt><dd><time datetime="2026-08-17T09:57:00.431106Z">2026-08-17T09:57:00.431106Z</time></dd><dt>Comparator</dt><dd>0.1.0</dd><dt>Schema</dt><dd>1.0</dd><dt>Scope</dt><dd>SHEETS, ROWS, COLUMNS</dd><dt>Sent directory</dt><dd><code>data/sent</code></dd><dt>Received directory</dt><dd><code>data/received</code></dd></dl></div>
+  </section>
+  <p class="print-only">Run 20260817T095700Z · generated 2026-08-17T09:57:00.431106Z</p>
+</main>
+<footer class="footer"><div class="footer__inner">POPS structural anomaly detector · Run <code>20260817T095700Z</code> · Generated <time datetime="2026-08-17T09:57:00.431106Z">2026-08-17T09:57:00.431106Z</time></div></footer>
+
+<script>
+(() => {
+  const search = document.getElementById('country-search');
+  const filter = document.getElementById('result-filter');
+  const count = document.getElementById('filter-count');
+  const rows = Array.from(document.querySelectorAll('#country-results tbody tr'));
+  if (!search || !filter || !count) return;
+  const update = () => {
+    const query = search.value.trim().toLocaleLowerCase();
+    const selected = filter.value;
+    let visible = 0;
+    rows.forEach((row) => {
+      const matchesText = !query || row.dataset.search.toLocaleLowerCase().includes(query);
+      const matchesStatus = selected === 'ALL' || row.dataset.status === selected || row.dataset.state === selected;
+      row.hidden = !(matchesText && matchesStatus);
+      if (!row.hidden) visible += 1;
+    });
+    count.textContent = `${visible} of ${rows.length} results shown`;
+  };
+  search.addEventListener('input', update);
+  filter.addEventListener('change', update);
+  update();
+})();
+
+(() => {
+  let closed = [];
+  window.addEventListener('beforeprint', () => {
+    closed = Array.from(document.querySelectorAll('details:not([open])'));
+    closed.forEach((item) => { item.open = true; });
+  });
+  window.addEventListener('afterprint', () => {
+    closed.forEach((item) => { item.open = false; });
+    closed = [];
+  });
+})();
+</script>
+</body>
+</html>

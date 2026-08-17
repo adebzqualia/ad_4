@@ -1,0 +1,1076 @@
+"""Read structural worksheet evidence directly from the XLSX OOXML package.
+
+The parser is intentionally read-only.  It treats worksheet ``dimension`` as
+diagnostic metadata and builds its own active structure from stored cells,
+row/column properties, ranges, tables, and drawing anchors.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import posixpath
+import re
+import unicodedata
+import zipfile
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import BinaryIO, Iterable
+from urllib.parse import unquote
+from xml.etree import ElementTree as ET
+
+from .config import AnalysisConfig
+from .coordinates import (
+    MAX_EXCEL_COLUMN,
+    MAX_EXCEL_ROW,
+    CellRange,
+    format_active_ref,
+    index_to_column,
+    parse_cell_reference,
+    parse_range_reference,
+)
+from .models import SheetMetrics
+
+
+class WorkbookReadError(RuntimeError):
+    """A workbook cannot be safely or faithfully analyzed."""
+
+
+@dataclass(frozen=True, slots=True)
+class AxisSignature:
+    index: int
+    weights: dict[str, float]
+    strong_tokens: frozenset[str]
+    digest: str
+    information: float
+
+
+@dataclass(slots=True)
+class SheetStructure:
+    name: str
+    index: int
+    state: str
+    sheet_type: str
+    part_name: str
+    metrics: SheetMetrics
+    rows: list[AxisSignature]
+    columns: list[AxisSignature]
+    cell_anchors: dict[str, list[tuple[int, int]]]
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class WorkbookStructure:
+    path: Path
+    sheets: list[SheetStructure]
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _RangeFeature:
+    kind: str
+    bounds: CellRange
+    strong: bool = False
+
+
+@dataclass(slots=True)
+class _SheetAccumulator:
+    row_weights: dict[int, dict[str, float]] = field(
+        default_factory=lambda: defaultdict(dict)
+    )
+    column_weights: dict[int, dict[str, float]] = field(
+        default_factory=lambda: defaultdict(dict)
+    )
+    row_strong: dict[int, set[str]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    column_strong: dict[int, set[str]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    cell_anchors: dict[str, list[tuple[int, int]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    ranges: list[_RangeFeature] = field(default_factory=list)
+    column_properties: list[tuple[int, int, str]] = field(default_factory=list)
+    content_rows: set[int] = field(default_factory=set)
+    content_columns: set[int] = field(default_factory=set)
+    active_max_row: int = 0
+    active_max_column: int = 0
+    content_min_row: int = MAX_EXCEL_ROW + 1
+    content_min_column: int = MAX_EXCEL_COLUMN + 1
+    content_max_row: int = 0
+    content_max_column: int = 0
+    cell_count: int = 0
+    formula_count: int = 0
+    styled_blank_count: int = 0
+    stored_cell_count: int = 0
+    merged_count: int = 0
+    table_count: int = 0
+    declared_dimension: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _attribute(element: ET.Element, name: str) -> str | None:
+    for key, value in element.attrib.items():
+        if _local_name(key) == name:
+            return value
+    return None
+
+
+def _hash_payload(payload: object, length: int = 24) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:length]
+
+
+def _canonical_xml(element: ET.Element) -> object:
+    false_default_attributes = {
+        "applyAlignment",
+        "applyBorder",
+        "applyFill",
+        "applyFont",
+        "applyNumberFormat",
+        "applyProtection",
+        "bestFit",
+        "collapsed",
+        "customFormat",
+        "customHeight",
+        "diagonalDown",
+        "diagonalUp",
+        "hidden",
+        "justifyLastLine",
+        "outline",
+        "pivotButton",
+        "quotePrefix",
+        "shadow",
+        "shrinkToFit",
+        "strike",
+        "wrapText",
+    }
+    zero_default_attributes = {"indent", "relativeIndent", "textRotation"}
+    attributes = sorted(
+        (_local_name(key), value)
+        for key, value in element.attrib.items()
+        if not (
+            value == "0"
+            and _local_name(key) in false_default_attributes | zero_default_attributes
+        )
+    )
+    children = [_canonical_xml(child) for child in list(element)]
+    text = (element.text or "").strip()
+    return (_local_name(element.tag), attributes, text, children)
+
+
+def _xml_root(archive: zipfile.ZipFile, part_name: str) -> ET.Element:
+    with archive.open(part_name) as stream:
+        return ET.parse(stream).getroot()
+
+
+def _normalize_text(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
+    return " ".join(value.split()).casefold()
+
+
+def _rich_text(element: ET.Element) -> str:
+    parts: list[str] = []
+
+    def visit(node: ET.Element) -> None:
+        name = _local_name(node.tag)
+        if name in {"rPh", "phoneticPr"}:
+            return
+        if name == "t":
+            parts.append(node.text or "")
+            return
+        for child in node:
+            visit(child)
+
+    visit(element)
+    return "".join(parts)
+
+
+_A1_REFERENCE_RE = re.compile(
+    r"(?<![A-Za-z0-9_.])"
+    r"(?:(?P<sheet>'(?:[^']|'')+'|(?:\[[^\]]+\])?[A-Za-z_][A-Za-z0-9_.]*)!)?"
+    r"(?P<first>\$?[A-Za-z]{1,3}\$?[0-9]{1,7})"
+    r"(?::(?P<second>\$?[A-Za-z]{1,3}\$?[0-9]{1,7}))?"
+    r"(?![A-Za-z0-9_.(])"
+)
+
+
+def _formula_segments(formula: str) -> Iterable[tuple[bool, str]]:
+    """Yield (is_string_literal, text), respecting doubled Excel quotes."""
+
+    start = 0
+    index = 0
+    in_string = False
+    while index < len(formula):
+        if formula[index] != '"':
+            index += 1
+            continue
+        if in_string and index + 1 < len(formula) and formula[index + 1] == '"':
+            index += 2
+            continue
+        if index > start:
+            yield in_string, formula[start:index]
+        yield True, '"'
+        in_string = not in_string
+        index += 1
+        start = index
+    if start < len(formula):
+        yield in_string, formula[start:]
+
+
+def _reference_shape(reference: str, base_row: int, base_col: int) -> tuple[str, str]:
+    row, col = parse_cell_reference(reference)
+    col_absolute = reference.startswith("$")
+    row_absolute = "$" in reference[1:]
+    shape = f"C{'$' if col_absolute else '~'}R{'$' if row_absolute else '~'}"
+    column_component = f"C${col}" if col_absolute else f"C[{col - base_col}]"
+    row_component = f"R${row}" if row_absolute else f"R[{row - base_row}]"
+    relative = f"{column_component}{row_component}"
+    return shape, relative
+
+
+def _normalize_formula(formula: str, row: int, col: int) -> tuple[str, str]:
+    shape_parts: list[str] = []
+    relative_parts: list[str] = []
+
+    def replace(segment: str, relative: bool) -> str:
+        def callback(match: re.Match[str]) -> str:
+            sheet = (match.group("sheet") or "").casefold()
+            first_shape, first_relative = _reference_shape(match.group("first"), row, col)
+            second = match.group("second")
+            if second:
+                second_shape, second_relative = _reference_shape(second, row, col)
+                body = (
+                    f"{first_relative}:{second_relative}"
+                    if relative
+                    else f"{first_shape}:{second_shape}"
+                )
+            else:
+                body = first_relative if relative else first_shape
+            return f"REF[{sheet}!{body}]"
+
+        return _A1_REFERENCE_RE.sub(callback, segment)
+
+    for is_string, segment in _formula_segments(formula):
+        if is_string:
+            normalized = segment
+            shape_parts.append(normalized)
+            relative_parts.append(normalized)
+        else:
+            compact = re.sub(r"\s+", "", segment).upper()
+            shape_parts.append(replace(compact, relative=False))
+            relative_parts.append(replace(compact, relative=True))
+    return "".join(shape_parts), "".join(relative_parts)
+
+
+def _add_weight(target: dict[int, dict[str, float]], index: int, token: str, weight: float) -> None:
+    bucket = target[index]
+    bucket[token] = bucket.get(token, 0.0) + weight
+
+
+def _mark_active(acc: _SheetAccumulator, row: int, col: int) -> None:
+    acc.active_max_row = max(acc.active_max_row, row)
+    acc.active_max_column = max(acc.active_max_column, col)
+
+
+def _mark_content(acc: _SheetAccumulator, row: int, col: int) -> None:
+    acc.content_rows.add(row)
+    acc.content_columns.add(col)
+    acc.content_min_row = min(acc.content_min_row, row)
+    acc.content_min_column = min(acc.content_min_column, col)
+    acc.content_max_row = max(acc.content_max_row, row)
+    acc.content_max_column = max(acc.content_max_column, col)
+
+
+class _StyleCatalog:
+    def __init__(self, fingerprints: list[str]):
+        self._fingerprints = fingerprints or [_hash_payload(("default",))]
+
+    def get(self, index: int, warnings: list[str]) -> str:
+        if 0 <= index < len(self._fingerprints):
+            return self._fingerprints[index]
+        raise WorkbookReadError(f"A cell references missing style index {index}.")
+
+
+def _parse_styles(archive: zipfile.ZipFile, part_name: str | None) -> _StyleCatalog:
+    if not part_name or part_name not in archive.namelist():
+        return _StyleCatalog([])
+    try:
+        root = _xml_root(archive, part_name)
+    except ET.ParseError as exc:
+        raise WorkbookReadError(f"Invalid styles XML ({part_name}): {exc}") from exc
+
+    sections: dict[str, list[ET.Element]] = defaultdict(list)
+    num_formats: dict[str, str] = {}
+    for child in root:
+        name = _local_name(child.tag)
+        sections[name] = list(child)
+        if name == "numFmts":
+            for item in child:
+                num_id = _attribute(item, "numFmtId")
+                code = _attribute(item, "formatCode")
+                if num_id is not None and code is not None:
+                    num_formats[num_id] = code
+
+    xfs = sections.get("cellXfs", [])
+    style_xfs = sections.get("cellStyleXfs", [])
+
+    def referenced(section: str, raw_index: str | None) -> object | None:
+        if raw_index is None:
+            return None
+        try:
+            item = sections.get(section, [])[int(raw_index)]
+        except (ValueError, IndexError):
+            return ("invalid-reference", section, raw_index)
+        return _canonical_xml(item)
+
+    def semantic_xf(xf: ET.Element, include_base: bool) -> object:
+        attributes = {_local_name(key): value for key, value in xf.attrib.items()}
+        font = referenced("fonts", attributes.pop("fontId", None))
+        fill = referenced("fills", attributes.pop("fillId", None))
+        border = referenced("borders", attributes.pop("borderId", None))
+        number_id = attributes.pop("numFmtId", None)
+        number_format = num_formats.get(number_id or "", f"builtin:{number_id}")
+        base_id = attributes.pop("xfId", None)
+        for key in list(attributes):
+            if attributes[key] == "0" and key in {
+                "applyAlignment",
+                "applyBorder",
+                "applyFill",
+                "applyFont",
+                "applyNumberFormat",
+                "applyProtection",
+                "pivotButton",
+                "quotePrefix",
+            }:
+                attributes.pop(key)
+        base = None
+        if include_base and base_id is not None:
+            try:
+                base = semantic_xf(style_xfs[int(base_id)], include_base=False)
+            except (ValueError, IndexError):
+                base = ("invalid-base", base_id)
+        return {
+            "attributes": sorted(attributes.items()),
+            "font": font,
+            "fill": fill,
+            "border": border,
+            "number_format": number_format,
+            "base": base,
+            "children": [_canonical_xml(child) for child in xf],
+        }
+
+    fingerprints: list[str] = []
+    for xf in xfs:
+        fingerprints.append(_hash_payload(semantic_xf(xf, include_base=True)))
+    return _StyleCatalog(fingerprints)
+
+
+def _parse_shared_strings(archive: zipfile.ZipFile, part_name: str | None) -> list[str]:
+    if not part_name or part_name not in archive.namelist():
+        return []
+    strings: list[str] = []
+    try:
+        with archive.open(part_name) as stream:
+            for event, element in ET.iterparse(stream, events=("end",)):
+                if _local_name(element.tag) != "si":
+                    continue
+                strings.append(_rich_text(element))
+                element.clear()
+    except ET.ParseError as exc:
+        raise WorkbookReadError(f"Invalid shared strings XML ({part_name}): {exc}") from exc
+    return strings
+
+
+def _relationships(archive: zipfile.ZipFile, rels_part: str) -> dict[str, tuple[str, str]]:
+    if rels_part not in archive.namelist():
+        return {}
+    try:
+        root = _xml_root(archive, rels_part)
+    except ET.ParseError as exc:
+        raise WorkbookReadError(f"Invalid relationships XML ({rels_part}): {exc}") from exc
+    result: dict[str, tuple[str, str]] = {}
+    for relation in root:
+        if _local_name(relation.tag) != "Relationship":
+            continue
+        if (_attribute(relation, "TargetMode") or "").lower() == "external":
+            continue
+        rel_id = _attribute(relation, "Id")
+        target = _attribute(relation, "Target")
+        rel_type = _attribute(relation, "Type") or ""
+        if rel_id and target:
+            result[rel_id] = (target, rel_type)
+    return result
+
+
+def _rels_part(part_name: str) -> str:
+    directory, filename = posixpath.split(part_name)
+    return posixpath.join(directory, "_rels", f"{filename}.rels")
+
+
+def _resolve_part(source_part: str, target: str) -> str:
+    target = unquote(target).replace("\\", "/")
+    if target.startswith("/"):
+        return posixpath.normpath(target.lstrip("/"))
+    return posixpath.normpath(posixpath.join(posixpath.dirname(source_part), target))
+
+
+def _office_document_part(archive: zipfile.ZipFile) -> str:
+    for _rel_id, (target, rel_type) in _relationships(archive, "_rels/.rels").items():
+        if rel_type.rstrip("/").endswith("/officeDocument"):
+            return posixpath.normpath(target.lstrip("/"))
+    if "xl/workbook.xml" in archive.namelist():
+        return "xl/workbook.xml"
+    raise WorkbookReadError("The package has no Office workbook relationship.")
+
+
+def _validate_archive(archive: zipfile.ZipFile, config: AnalysisConfig) -> None:
+    names: set[str] = set()
+    total = 0
+    for info in archive.infolist():
+        normalized = posixpath.normpath(info.filename.replace("\\", "/"))
+        if normalized.startswith("../") or normalized.startswith("/"):
+            raise WorkbookReadError(f"Unsafe package member path: {info.filename!r}")
+        if normalized in names:
+            raise WorkbookReadError(f"Duplicate package member: {normalized!r}")
+        names.add(normalized)
+        if info.flag_bits & 0x1:
+            raise WorkbookReadError("Encrypted XLSX package members are not supported.")
+        total += info.file_size
+        if total > config.max_uncompressed_bytes:
+            raise WorkbookReadError(
+                f"Workbook expands beyond the configured {config.max_uncompressed_bytes:,}-byte limit."
+            )
+        if normalized.lower().endswith(".xml") and info.file_size > config.max_xml_part_bytes:
+            raise WorkbookReadError(
+                f"XML part {normalized!r} exceeds the configured {config.max_xml_part_bytes:,}-byte limit."
+            )
+
+
+def _range_references(raw: str | None) -> Iterable[str]:
+    if not raw:
+        return []
+    return [item for item in raw.replace(",", " ").split() if item]
+
+
+def _register_range(
+    acc: _SheetAccumulator,
+    reference: str,
+    kind: str,
+    *,
+    strong: bool = False,
+    affects_extent: bool = True,
+) -> None:
+    acc.stored_cell_count += 1
+    try:
+        bounds = parse_range_reference(reference)
+    except ValueError:
+        if strong:
+            raise WorkbookReadError(f"Invalid {kind} range reference {reference!r}.")
+        acc.warnings.append(f"Ignored invalid {kind} range reference {reference!r}.")
+        return
+    acc.ranges.append(_RangeFeature(kind, bounds, strong))
+    if affects_extent and bounds.max_row < MAX_EXCEL_ROW:
+        acc.active_max_row = max(acc.active_max_row, bounds.max_row)
+    if affects_extent and bounds.max_col < MAX_EXCEL_COLUMN:
+        acc.active_max_column = max(acc.active_max_column, bounds.max_col)
+
+
+def _property_token(
+    element: ET.Element,
+    ignored: set[str],
+    defaults: dict[str, str] | None = None,
+    *,
+    style_attribute: str | None = None,
+    styles: _StyleCatalog | None = None,
+    warnings: list[str] | None = None,
+) -> str | None:
+    defaults = defaults or {}
+    attributes = [
+        [_local_name(key), value]
+        for key, value in element.attrib.items()
+        if _local_name(key) not in ignored
+        and value != defaults.get(_local_name(key))
+    ]
+    if style_attribute and styles:
+        for item in attributes:
+            if item[0] != style_attribute:
+                continue
+            try:
+                item[1] = f"semantic:{styles.get(int(item[1]), warnings or [])}"
+            except ValueError as exc:
+                raise WorkbookReadError(
+                    f"Invalid row/column style index {item[1]!r}."
+                ) from exc
+    attributes.sort()
+    if not attributes:
+        return None
+    return _hash_payload(attributes)
+
+
+def _parse_cell(
+    cell: ET.Element,
+    row: int,
+    col: int,
+    styles: _StyleCatalog,
+    shared_strings: list[str],
+    shared_formulas: dict[str, tuple[str, str]],
+    acc: _SheetAccumulator,
+) -> None:
+    cell_type = _attribute(cell, "t") or "n"
+    style_index_raw = _attribute(cell, "s") or "0"
+    try:
+        style_index = int(style_index_raw)
+    except ValueError:
+        style_index = -1
+    style = styles.get(style_index, acc.warnings)
+
+    formula_element = next((node for node in cell if _local_name(node.tag) == "f"), None)
+    value_element = next((node for node in cell if _local_name(node.tag) == "v"), None)
+    inline_element = next((node for node in cell if _local_name(node.tag) == "is"), None)
+    formula = formula_element.text if formula_element is not None else None
+    raw_value = value_element.text if value_element is not None else None
+    inline_value = None
+    if inline_element is not None:
+        inline_value = _rich_text(inline_element)
+
+    has_formula = formula_element is not None
+    has_content = has_formula or raw_value is not None or inline_value is not None
+    # A default-style empty <c> is serialization noise, not a materialized
+    # row/column.  Styled blanks, on the other hand, are template evidence.
+    if not has_content and style_index == 0:
+        return
+    acc.cell_count += int(has_content)
+    acc.formula_count += int(has_formula)
+    acc.styled_blank_count += int(not has_content and style_index != 0)
+    _mark_active(acc, row, col)
+    if has_content:
+        _mark_content(acc, row, col)
+
+    style_token = f"S:{style}"
+    _add_weight(acc.row_weights, row, style_token, 1.0)
+    _add_weight(acc.column_weights, col, style_token, 1.0)
+
+    kind = (
+        "FORMULA"
+        if has_formula
+        else "TEXT"
+        if cell_type in {"s", "inlineStr", "str"}
+        else "VALUE"
+        if has_content
+        else "BLANK_STYLED"
+    )
+    _add_weight(acc.row_weights, row, f"K:{kind}", 0.35)
+    _add_weight(acc.column_weights, col, f"K:{kind}", 0.35)
+
+    if has_formula:
+        formula_type = _attribute(formula_element, "t") or "normal"
+        shared_index = _attribute(formula_element, "si")
+        cached_normalization = shared_formulas.get(shared_index or "")
+        if formula_type == "shared" and formula is None and cached_normalization is not None:
+            shape, relative = cached_normalization
+        else:
+            formula_text = formula or f"{formula_type.upper()}:{shared_index or '?'}"
+            try:
+                shape, relative = _normalize_formula(formula_text, row, col)
+            except ValueError:
+                shape = re.sub(r"\s+", "", formula_text).upper()
+                relative = shape
+            if formula_type == "shared" and shared_index and formula is not None:
+                shared_formulas[shared_index] = (shape, relative)
+        shape_token = f"F:{_hash_payload(shape)}"
+        relative_token = f"R:{_hash_payload(relative)}"
+        for target, axis in ((acc.row_weights, row), (acc.column_weights, col)):
+            _add_weight(target, axis, shape_token, 1.0)
+            _add_weight(target, axis, relative_token, 2.75)
+        acc.row_strong[row].add(relative_token)
+        acc.column_strong[col].add(relative_token)
+        acc.cell_anchors[relative_token].append((row, col))
+        return
+
+    text_value: str | None = None
+    if cell_type == "s" and raw_value is not None:
+        try:
+            text_value = shared_strings[int(raw_value)]
+        except (ValueError, IndexError):
+            raise WorkbookReadError(
+                f"Cell {index_to_column(col)}{row} has an invalid shared-string index."
+            )
+    elif cell_type in {"inlineStr", "str"}:
+        text_value = inline_value if inline_value is not None else raw_value
+
+    if text_value is not None:
+        normalized = _normalize_text(text_value)
+        if normalized:
+            token = f"T:{_hash_payload(normalized)}"
+            _add_weight(acc.row_weights, row, token, 5.0)
+            _add_weight(acc.column_weights, col, token, 5.0)
+            acc.row_strong[row].add(token)
+            acc.column_strong[col].add(token)
+            acc.cell_anchors[token].append((row, col))
+    elif raw_value is not None:
+        token = f"V:{_hash_payload(raw_value)}"
+        _add_weight(acc.row_weights, row, token, 0.45)
+        _add_weight(acc.column_weights, col, token, 0.45)
+
+
+def _read_table_ranges(
+    archive: zipfile.ZipFile,
+    sheet_part: str,
+    relation_ids: list[str],
+    relationships: dict[str, tuple[str, str]],
+    acc: _SheetAccumulator,
+) -> None:
+    for relation_id in relation_ids:
+        relation = relationships.get(relation_id)
+        if not relation:
+            raise WorkbookReadError(f"Missing table relationship {relation_id!r}.")
+        part = _resolve_part(sheet_part, relation[0])
+        if part not in archive.namelist():
+            raise WorkbookReadError(f"Missing table part {part!r}.")
+        try:
+            root = _xml_root(archive, part)
+        except ET.ParseError as exc:
+            raise WorkbookReadError(f"Invalid table part {part!r}: {exc}.") from exc
+        reference = _attribute(root, "ref")
+        if reference:
+            _register_range(acc, reference, "TABLE", strong=True)
+            acc.table_count += 1
+
+
+def _read_drawing_ranges(
+    archive: zipfile.ZipFile,
+    sheet_part: str,
+    relation_ids: list[str],
+    relationships: dict[str, tuple[str, str]],
+    acc: _SheetAccumulator,
+) -> None:
+    for relation_id in relation_ids:
+        relation = relationships.get(relation_id)
+        if not relation:
+            continue
+        part = _resolve_part(sheet_part, relation[0])
+        if part not in archive.namelist():
+            continue
+        try:
+            root = _xml_root(archive, part)
+        except ET.ParseError:
+            acc.warnings.append(f"Invalid drawing part {part!r}; its anchors were ignored.")
+            continue
+        for anchor in root:
+            if _local_name(anchor.tag) not in {"oneCellAnchor", "twoCellAnchor", "absoluteAnchor"}:
+                continue
+            points: list[tuple[int, int]] = []
+            for marker in anchor:
+                if _local_name(marker.tag) not in {"from", "to"}:
+                    continue
+                row_text = next((n.text for n in marker if _local_name(n.tag) == "row"), None)
+                col_text = next((n.text for n in marker if _local_name(n.tag) == "col"), None)
+                if row_text is not None and col_text is not None:
+                    try:
+                        points.append((int(row_text) + 1, int(col_text) + 1))
+                    except ValueError:
+                        pass
+            if points:
+                rows = [point[0] for point in points]
+                cols = [point[1] for point in points]
+                _register_range(
+                    acc,
+                    f"{index_to_column(min(cols))}{min(rows)}:{index_to_column(max(cols))}{max(rows)}",
+                    "DRAWING",
+                    affects_extent=False,
+                )
+
+
+def _apply_range_features(acc: _SheetAccumulator) -> None:
+    for feature in acc.ranges:
+        bounds = feature.bounds
+        weight = 2.5 if feature.strong else 0.8
+        row_end = min(bounds.max_row, acc.active_max_row)
+        col_end = min(bounds.max_col, acc.active_max_column)
+
+        if bounds.min_row <= row_end:
+            rows: set[int] = {bounds.min_row, row_end}
+            if row_end - bounds.min_row <= 5_000:
+                rows.update(range(bounds.min_row, row_end + 1))
+            for row in rows:
+                role = "START" if row == bounds.min_row else "END" if row == row_end else "INSIDE"
+                token = f"RG:{feature.kind}:ROW:{role}"
+                _add_weight(acc.row_weights, row, token, weight)
+                if feature.strong and role != "INSIDE":
+                    acc.row_strong[row].add(token)
+
+        if bounds.min_col <= col_end:
+            columns: set[int] = {bounds.min_col, col_end}
+            if col_end - bounds.min_col <= 2_000:
+                columns.update(range(bounds.min_col, col_end + 1))
+            for col in columns:
+                role = "START" if col == bounds.min_col else "END" if col == col_end else "INSIDE"
+                token = f"RG:{feature.kind}:COL:{role}"
+                _add_weight(acc.column_weights, col, token, weight)
+                if feature.strong and role != "INSIDE":
+                    acc.column_strong[col].add(token)
+
+    for start, end, token_hash in acc.column_properties:
+        bounded_end = min(end, acc.active_max_column)
+        for col in range(start, bounded_end + 1):
+            token = f"CP:{token_hash}"
+            _add_weight(acc.column_weights, col, token, 2.0)
+
+
+def _axis_signatures(
+    maximum: int,
+    weights: dict[int, dict[str, float]],
+    strong: dict[int, set[str]],
+) -> list[AxisSignature]:
+    signatures: list[AxisSignature] = []
+    for index in range(1, maximum + 1):
+        item_weights = weights.get(index)
+        if not item_weights:
+            item_weights = {"__BLANK__": 1.0}
+            information = 0.0
+        else:
+            information = sum(item_weights.values())
+        digest = _hash_payload(sorted(item_weights.items()), length=32)
+        signatures.append(
+            AxisSignature(
+                index=index,
+                weights=dict(item_weights),
+                strong_tokens=frozenset(strong.get(index, set())),
+                digest=digest,
+                information=information,
+            )
+        )
+    return signatures
+
+
+def _format_bbox(min_row: int, min_col: int, max_row: int, max_col: int) -> str | None:
+    if max_row <= 0 or max_col <= 0:
+        return None
+    return f"{index_to_column(min_col)}{min_row}:{index_to_column(max_col)}{max_row}"
+
+
+def _parse_worksheet(
+    archive: zipfile.ZipFile,
+    part_name: str,
+    name: str,
+    index: int,
+    state: str,
+    styles: _StyleCatalog,
+    shared_strings: list[str],
+    config: AnalysisConfig,
+) -> SheetStructure:
+    if part_name not in archive.namelist():
+        raise WorkbookReadError(f"Worksheet {name!r} points to missing part {part_name!r}.")
+
+    acc = _SheetAccumulator()
+    current_row = 0
+    in_row = False
+    next_row = 1
+    next_column = 1
+    table_relation_ids: list[str] = []
+    drawing_relation_ids: list[str] = []
+    shared_formulas: dict[str, tuple[str, str]] = {}
+    seen_rows: set[int] = set()
+    seen_cells: set[tuple[int, int]] = set()
+    relationships = _relationships(archive, _rels_part(part_name))
+
+    stream: BinaryIO | None = None
+    try:
+        stream = archive.open(part_name)
+        for event, element in ET.iterparse(stream, events=("start", "end")):
+            tag = _local_name(element.tag)
+            if event == "start":
+                if tag == "dimension":
+                    acc.declared_dimension = _attribute(element, "ref")
+                elif tag == "row":
+                    raw_row = _attribute(element, "r")
+                    try:
+                        current_row = int(raw_row) if raw_row else next_row
+                    except ValueError:
+                        raise WorkbookReadError(f"Worksheet {name!r} contains an invalid row index.")
+                    if not 1 <= current_row <= MAX_EXCEL_ROW:
+                        raise WorkbookReadError(
+                            f"Worksheet {name!r} contains out-of-range row {current_row}."
+                        )
+                    if current_row in seen_rows:
+                        raise WorkbookReadError(
+                            f"Worksheet {name!r} contains duplicate row {current_row}."
+                        )
+                    seen_rows.add(current_row)
+                    in_row = True
+                    next_row = current_row + 1
+                    next_column = 1
+                    token = _property_token(
+                        element,
+                        {"r", "spans"},
+                        {
+                            "hidden": "0",
+                            "customFormat": "0",
+                            "customHeight": "0",
+                            "outlineLevel": "0",
+                            "collapsed": "0",
+                            "thickTop": "0",
+                            "thickBot": "0",
+                            "s": "0",
+                        },
+                        style_attribute="s",
+                        styles=styles,
+                        warnings=acc.warnings,
+                    )
+                    if token:
+                        _add_weight(acc.row_weights, current_row, f"RP:{token}", 2.0)
+                        acc.active_max_row = max(acc.active_max_row, current_row)
+                elif tag == "col":
+                    try:
+                        start = int(_attribute(element, "min") or "0")
+                        end = int(_attribute(element, "max") or "0")
+                    except ValueError as exc:
+                        raise WorkbookReadError(f"Worksheet {name!r} contains invalid column metadata.") from exc
+                    token = _property_token(
+                        element,
+                        {"min", "max"},
+                        {
+                            "hidden": "0",
+                            "outlineLevel": "0",
+                            "collapsed": "0",
+                            "bestFit": "0",
+                            "customWidth": "0",
+                            "style": "0",
+                            "phonetic": "0",
+                        },
+                        style_attribute="style",
+                        styles=styles,
+                        warnings=acc.warnings,
+                    )
+                    if token and 1 <= start <= end <= MAX_EXCEL_COLUMN:
+                        acc.column_properties.append((start, end, token))
+                        if end < MAX_EXCEL_COLUMN:
+                            acc.active_max_column = max(acc.active_max_column, end)
+                        else:
+                            acc.warnings.append(
+                                "A column property spans through XFD; it is retained within the "
+                                "active area but does not define the active-column count."
+                            )
+                elif tag == "mergeCell":
+                    reference = _attribute(element, "ref")
+                    if reference:
+                        _register_range(acc, reference, "MERGE", strong=True)
+                        acc.merged_count += 1
+                elif tag == "autoFilter":
+                    for reference in _range_references(_attribute(element, "ref")):
+                        _register_range(acc, reference, "AUTOFILTER", strong=True)
+                elif tag == "conditionalFormatting":
+                    for reference in _range_references(_attribute(element, "sqref")):
+                        _register_range(acc, reference, "CONDITIONAL_FORMAT")
+                elif tag == "dataValidation":
+                    for reference in _range_references(_attribute(element, "sqref")):
+                        _register_range(acc, reference, "DATA_VALIDATION")
+                elif tag == "hyperlink":
+                    for reference in _range_references(_attribute(element, "ref")):
+                        _register_range(acc, reference, "HYPERLINK")
+                elif tag == "pane":
+                    reference = _attribute(element, "topLeftCell")
+                    if reference:
+                        _register_range(acc, reference, "FREEZE_PANE", affects_extent=False)
+                elif tag == "tablePart":
+                    relation_id = _attribute(element, "id")
+                    if relation_id:
+                        table_relation_ids.append(relation_id)
+                elif tag == "drawing":
+                    relation_id = _attribute(element, "id")
+                    if relation_id:
+                        drawing_relation_ids.append(relation_id)
+                continue
+
+            if tag == "c":
+                if not in_row:
+                    raise WorkbookReadError(
+                        f"Worksheet {name!r} contains a cell outside a row element."
+                    )
+                reference = _attribute(element, "r")
+                if reference:
+                    try:
+                        row, col = parse_cell_reference(reference)
+                    except ValueError as exc:
+                        raise WorkbookReadError(
+                            f"Worksheet {name!r} contains invalid cell reference {reference!r}."
+                        ) from exc
+                else:
+                    row, col = current_row, next_column
+                if row != current_row:
+                    raise WorkbookReadError(
+                        f"Cell {reference!r} is inconsistent with enclosing row {current_row} "
+                        f"in worksheet {name!r}."
+                    )
+                if (row, col) in seen_cells:
+                    raise WorkbookReadError(
+                        f"Worksheet {name!r} contains duplicate cell {index_to_column(col)}{row}."
+                    )
+                seen_cells.add((row, col))
+                next_column = col + 1
+                _parse_cell(
+                    element,
+                    row,
+                    col,
+                    styles,
+                    shared_strings,
+                    shared_formulas,
+                    acc,
+                )
+                if acc.stored_cell_count > config.max_cells_per_sheet:
+                    raise WorkbookReadError(
+                        f"Worksheet {name!r} exceeds the configured {config.max_cells_per_sheet:,}-cell limit."
+                    )
+                element.clear()
+            elif tag == "row":
+                in_row = False
+                element.clear()
+    except ET.ParseError as exc:
+        raise WorkbookReadError(f"Invalid worksheet XML for {name!r}: {exc}") from exc
+    finally:
+        if stream is not None:
+            stream.close()
+
+    _read_table_ranges(archive, part_name, table_relation_ids, relationships, acc)
+    _read_drawing_ranges(archive, part_name, drawing_relation_ids, relationships, acc)
+
+    if acc.active_max_row > config.max_active_rows:
+        raise WorkbookReadError(
+            f"Worksheet {name!r} has active evidence at row {acc.active_max_row:,}, beyond the "
+            f"configured {config.max_active_rows:,}-row analysis limit. Increase --max-active-rows "
+            "only after checking for stray far-away formatting."
+        )
+    if acc.active_max_column > config.max_active_columns:
+        raise WorkbookReadError(
+            f"Worksheet {name!r} has active evidence at column {acc.active_max_column:,}, beyond "
+            f"the configured {config.max_active_columns:,}-column analysis limit."
+        )
+
+    _apply_range_features(acc)
+    rows = _axis_signatures(acc.active_max_row, acc.row_weights, acc.row_strong)
+    columns = _axis_signatures(acc.active_max_column, acc.column_weights, acc.column_strong)
+    content_ref = _format_bbox(
+        acc.content_min_row,
+        acc.content_min_column,
+        acc.content_max_row,
+        acc.content_max_column,
+    )
+    metrics = SheetMetrics(
+        active_rows=acc.active_max_row,
+        active_columns=acc.active_max_column,
+        content_rows=len(acc.content_rows),
+        content_columns=len(acc.content_columns),
+        populated_cells=acc.cell_count,
+        formula_cells=acc.formula_count,
+        styled_blank_cells=acc.styled_blank_count,
+        merged_ranges=acc.merged_count,
+        table_ranges=acc.table_count,
+        active_ref=format_active_ref(acc.active_max_row, acc.active_max_column),
+        content_ref=content_ref,
+        declared_dimension=acc.declared_dimension,
+    )
+    return SheetStructure(
+        name=name,
+        index=index,
+        state=state,
+        sheet_type="worksheet",
+        part_name=part_name,
+        metrics=metrics,
+        rows=rows,
+        columns=columns,
+        cell_anchors=dict(acc.cell_anchors),
+        warnings=acc.warnings,
+    )
+
+
+def _empty_nonworksheet(
+    name: str,
+    index: int,
+    state: str,
+    sheet_type: str,
+    part_name: str,
+) -> SheetStructure:
+    return SheetStructure(
+        name=name,
+        index=index,
+        state=state,
+        sheet_type=sheet_type,
+        part_name=part_name,
+        metrics=SheetMetrics(),
+        rows=[],
+        columns=[],
+        cell_anchors={},
+    )
+
+
+def read_workbook(path: Path, config: AnalysisConfig) -> WorkbookStructure:
+    """Open one XLSX read-only and return a normalized structural profile."""
+
+    try:
+        archive = zipfile.ZipFile(path, "r")
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise WorkbookReadError(f"Cannot open {path.name!r} as an XLSX package: {exc}") from exc
+
+    with archive:
+        _validate_archive(archive, config)
+        workbook_part = _office_document_part(archive)
+        if workbook_part not in archive.namelist():
+            raise WorkbookReadError(f"Workbook part {workbook_part!r} is missing.")
+        workbook_relationships = _relationships(archive, _rels_part(workbook_part))
+        styles_part = None
+        strings_part = None
+        for target, rel_type in workbook_relationships.values():
+            if rel_type.rstrip("/").endswith("/styles"):
+                styles_part = _resolve_part(workbook_part, target)
+            elif rel_type.rstrip("/").endswith("/sharedStrings"):
+                strings_part = _resolve_part(workbook_part, target)
+        styles = _parse_styles(archive, styles_part)
+        shared_strings = _parse_shared_strings(archive, strings_part)
+
+        try:
+            workbook_root = _xml_root(archive, workbook_part)
+        except ET.ParseError as exc:
+            raise WorkbookReadError(f"Invalid workbook XML: {exc}") from exc
+
+        sheet_elements = [node for node in workbook_root.iter() if _local_name(node.tag) == "sheet"]
+        sheets: list[SheetStructure] = []
+        warnings: list[str] = []
+        seen_names: set[str] = set()
+        for index, element in enumerate(sheet_elements, start=1):
+            name = _attribute(element, "name") or f"Unnamed sheet {index}"
+            folded = name.casefold()
+            if folded in seen_names:
+                raise WorkbookReadError(f"Workbook contains duplicate sheet name {name!r}.")
+            seen_names.add(folded)
+            state = _attribute(element, "state") or "visible"
+            relation_id = _attribute(element, "id")
+            relation = workbook_relationships.get(relation_id or "")
+            if not relation:
+                raise WorkbookReadError(f"Sheet {name!r} has no valid package relationship.")
+            part_name = _resolve_part(workbook_part, relation[0])
+            relation_type = relation[1].rstrip("/").rsplit("/", 1)[-1].lower()
+            if relation_type == "worksheet":
+                sheet = _parse_worksheet(
+                    archive,
+                    part_name,
+                    name,
+                    index,
+                    state,
+                    styles,
+                    shared_strings,
+                    config,
+                )
+            else:
+                sheet = _empty_nonworksheet(name, index, state, relation_type, part_name)
+            sheets.append(sheet)
+            warnings.extend(f"{name}: {warning}" for warning in sheet.warnings)
+
+        return WorkbookStructure(path=path, sheets=sheets, warnings=warnings)

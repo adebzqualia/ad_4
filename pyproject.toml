@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pops-anomaly-detector"
+version = "0.1.0"
+description = "Auditable structural anomaly detection for paired POPS Excel workbooks"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "POPS Team" }]
+dependencies = []
+
+[project.scripts]
+pops-anomaly = "pops_anomaly_detector.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
