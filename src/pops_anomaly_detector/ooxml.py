@@ -16,6 +16,7 @@ import unicodedata
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import BinaryIO, Iterable
 from urllib.parse import unquote
@@ -31,7 +32,7 @@ from .coordinates import (
     parse_cell_reference,
     parse_range_reference,
 )
-from .models import SheetMetrics
+from .models import KpiColumnSnapshot, KpiEntry, SheetMetrics
 
 
 class WorkbookReadError(RuntimeError):
@@ -58,6 +59,10 @@ class SheetStructure:
     rows: list[AxisSignature]
     columns: list[AxisSignature]
     cell_anchors: dict[str, list[tuple[int, int]]]
+    kpi_snapshot: KpiColumnSnapshot
+    ref_error_coordinates: list[str] = field(default_factory=list)
+    cached_ref_error_coordinates: list[str] = field(default_factory=list)
+    formula_ref_error_coordinates: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -73,6 +78,17 @@ class _RangeFeature:
     kind: str
     bounds: CellRange
     strong: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _SemanticCell:
+    row: int
+    col: int
+    display_value: str
+    comparison_key: str | None
+    value_kind: str
+    confidence: str
+    literal_text: bool = False
 
 
 @dataclass(slots=True)
@@ -109,6 +125,15 @@ class _SheetAccumulator:
     merged_count: int = 0
     table_count: int = 0
     declared_dimension: str | None = None
+    capture_kpi: bool = False
+    kpi_semantic_cell_limit: int = 0
+    kpi_semantic_cells: list[_SemanticCell] = field(default_factory=list)
+    ref_error_count: int = 0
+    cached_ref_error_count: int = 0
+    formula_ref_error_count: int = 0
+    ref_error_coordinates: list[str] = field(default_factory=list)
+    cached_ref_error_coordinates: list[str] = field(default_factory=list)
+    formula_ref_error_coordinates: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -171,9 +196,60 @@ def _xml_root(archive: zipfile.ZipFile, part_name: str) -> ET.Element:
         return ET.parse(stream).getroot()
 
 
-def _normalize_text(value: str) -> str:
+_REF_ERROR_COORDINATE_LIMIT = 200
+
+
+def _normalize_display_text(value: str) -> str:
     value = unicodedata.normalize("NFKC", value)
-    return " ".join(value.split()).casefold()
+    return " ".join(value.split())
+
+
+def _normalize_text(value: str) -> str:
+    return _normalize_display_text(value).casefold()
+
+
+def _formula_contains_ref_error(formula: str) -> bool:
+    """Return whether a formula contains an unquoted ``#REF!`` token.
+
+    Excel uses double quotes for string literals and single quotes for sheet or
+    external-workbook identifiers. Both quote forms escape themselves by
+    doubling the quote character. A lexical scan avoids counting text such as
+    ``IFERROR(A1, "#REF!")`` or a reference to a sheet named ``#REF!``.
+    """
+
+    index = 0
+    in_double_string = False
+    in_single_identifier = False
+    while index < len(formula):
+        char = formula[index]
+        if in_double_string:
+            if char == '"':
+                if index + 1 < len(formula) and formula[index + 1] == '"':
+                    index += 2
+                    continue
+                in_double_string = False
+            index += 1
+            continue
+        if in_single_identifier:
+            if char == "'":
+                if index + 1 < len(formula) and formula[index + 1] == "'":
+                    index += 2
+                    continue
+                in_single_identifier = False
+            index += 1
+            continue
+        if char == '"':
+            in_double_string = True
+            index += 1
+            continue
+        if char == "'":
+            in_single_identifier = True
+            index += 1
+            continue
+        if formula[index : index + 5].casefold() == "#ref!":
+            return True
+        index += 1
+    return False
 
 
 def _rich_text(element: ET.Element) -> str:
@@ -515,6 +591,296 @@ def _property_token(
     return _hash_payload(attributes)
 
 
+def _canonical_number(raw_value: str) -> tuple[str, str] | None:
+    try:
+        value = Decimal(raw_value.strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not value.is_finite():
+        return None
+    if value == 0:
+        return "0", "NUMBER:0E0"
+    sign, raw_digits, exponent = value.as_tuple()
+    digits = list(raw_digits)
+    while digits and digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    coefficient = "".join(str(digit) for digit in digits)
+    canonical = f"{'-' if sign else ''}{coefficient}E{exponent}"
+    return str(value), f"NUMBER:{canonical}"
+
+
+def _semantic_cell(
+    *,
+    row: int,
+    col: int,
+    cell_type: str,
+    has_formula: bool,
+    cache_present: bool,
+    raw_value: str | None,
+    inline_value: str | None,
+    shared_strings: list[str],
+) -> _SemanticCell | None:
+    """Resolve the stored scalar without evaluating formulas."""
+
+    kind_prefix = "FORMULA_" if has_formula else ""
+    confidence = "MEDIUM" if has_formula else "HIGH"
+    if has_formula and not cache_present:
+        return _SemanticCell(
+            row=row,
+            col=col,
+            display_value="<formula result unavailable>",
+            comparison_key=None,
+            value_kind="FORMULA_UNRESOLVED",
+            confidence="LOW",
+        )
+
+    if cell_type == "s":
+        if raw_value is None:
+            return None
+        try:
+            value = shared_strings[int(raw_value)]
+        except (ValueError, IndexError):
+            raise WorkbookReadError(
+                f"Cell {index_to_column(col)}{row} has an invalid shared-string index."
+            )
+        display = _normalize_display_text(value)
+        if not display:
+            return None
+        return _SemanticCell(
+            row=row,
+            col=col,
+            display_value=display,
+            comparison_key=f"TEXT:{display}",
+            value_kind=f"{kind_prefix}TEXT",
+            confidence=confidence,
+            literal_text=not has_formula,
+        )
+
+    if cell_type in {"inlineStr", "str"}:
+        value = inline_value if inline_value is not None else raw_value
+        # A present empty string cache is a known blank result, not an
+        # unavailable formula result.
+        display = _normalize_display_text(value or "")
+        if not display:
+            return None
+        return _SemanticCell(
+            row=row,
+            col=col,
+            display_value=display,
+            comparison_key=f"TEXT:{display}",
+            value_kind=f"{kind_prefix}TEXT",
+            confidence=confidence,
+            literal_text=not has_formula,
+        )
+
+    if cell_type == "b":
+        normalized = (raw_value or "").strip().casefold()
+        if normalized in {"1", "true"}:
+            display, key = "TRUE", "BOOLEAN:true"
+        elif normalized in {"0", "false"}:
+            display, key = "FALSE", "BOOLEAN:false"
+        else:
+            return _SemanticCell(
+                row=row,
+                col=col,
+                display_value=raw_value or "<invalid boolean>",
+                comparison_key=None,
+                value_kind=f"{kind_prefix}BOOLEAN_INVALID",
+                confidence="LOW",
+            )
+        return _SemanticCell(
+            row=row,
+            col=col,
+            display_value=display,
+            comparison_key=key,
+            value_kind=f"{kind_prefix}BOOLEAN",
+            confidence=confidence,
+        )
+
+    if cell_type == "e":
+        return _SemanticCell(
+            row=row,
+            col=col,
+            display_value=_normalize_display_text(raw_value or "<error>"),
+            comparison_key=None,
+            value_kind=f"{kind_prefix}ERROR",
+            confidence=confidence,
+        )
+
+    if cell_type == "d":
+        display = _normalize_display_text(raw_value or "")
+        if not display:
+            return None
+        return _SemanticCell(
+            row=row,
+            col=col,
+            display_value=display,
+            comparison_key=f"DATE:{display}",
+            value_kind=f"{kind_prefix}DATE",
+            confidence=confidence,
+        )
+
+    if raw_value is None:
+        if has_formula:
+            return _SemanticCell(
+                row=row,
+                col=col,
+                display_value="<formula result unavailable>",
+                comparison_key=None,
+                value_kind="FORMULA_UNRESOLVED",
+                confidence="LOW",
+            )
+        return None
+    number = _canonical_number(raw_value)
+    if number is None:
+        return _SemanticCell(
+            row=row,
+            col=col,
+            display_value=raw_value,
+            comparison_key=None,
+            value_kind=f"{kind_prefix}NUMBER_INVALID",
+            confidence="LOW",
+        )
+    display, key = number
+    return _SemanticCell(
+        row=row,
+        col=col,
+        display_value=display,
+        comparison_key=key,
+        value_kind=f"{kind_prefix}NUMBER",
+        confidence=confidence,
+    )
+
+
+def _append_capped(target: list[str], coordinate: str) -> None:
+    if len(target) < _REF_ERROR_COORDINATE_LIMIT:
+        target.append(coordinate)
+
+
+def _record_ref_errors(
+    acc: _SheetAccumulator,
+    coordinate: str,
+    *,
+    cached_error: bool,
+    formula_error: bool,
+) -> None:
+    if cached_error:
+        acc.cached_ref_error_count += 1
+        _append_capped(acc.cached_ref_error_coordinates, coordinate)
+    if formula_error:
+        acc.formula_ref_error_count += 1
+        _append_capped(acc.formula_ref_error_coordinates, coordinate)
+    if cached_error or formula_error:
+        acc.ref_error_count += 1
+        _append_capped(acc.ref_error_coordinates, coordinate)
+
+
+def _capture_kpi_semantic_cell(
+    acc: _SheetAccumulator,
+    semantic: _SemanticCell | None,
+) -> None:
+    if not acc.capture_kpi or semantic is None:
+        return
+    if len(acc.kpi_semantic_cells) >= acc.kpi_semantic_cell_limit:
+        raise WorkbookReadError(
+            "The KPI worksheet exceeds the configured "
+            f"{acc.kpi_semantic_cell_limit:,}-semantic-cell limit."
+        )
+    acc.kpi_semantic_cells.append(semantic)
+
+
+def _kpi_snapshot(acc: _SheetAccumulator, header_scan_rows: int) -> KpiColumnSnapshot:
+    if not acc.capture_kpi:
+        return KpiColumnSnapshot(status="NOT_APPLICABLE")
+
+    candidates = sorted(
+        (
+            item
+            for item in acc.kpi_semantic_cells
+            if item.row <= header_scan_rows
+            and item.literal_text
+            and _normalize_text(item.display_value) == "kpi"
+        ),
+        key=lambda item: (item.row, item.col),
+    )
+    candidate_coordinates = [
+        f"{index_to_column(item.col)}{item.row}" for item in candidates
+    ]
+    scan_note = f"Literal KPI headers were searched in the first {header_scan_rows:,} rows."
+    if not candidates:
+        return KpiColumnSnapshot(
+            status="MISSING",
+            header_candidates=[],
+            notes=[scan_note, "No literal text cell normalized exactly to 'KPI'."],
+        )
+    if len(candidates) > 1:
+        return KpiColumnSnapshot(
+            status="AMBIGUOUS",
+            header_candidates=candidate_coordinates,
+            notes=[
+                scan_note,
+                f"{len(candidates)} possible KPI headers were found; no header was guessed.",
+            ],
+        )
+
+    header = candidates[0]
+    header_coordinate = candidate_coordinates[0]
+    body = sorted(
+        (
+            item
+            for item in acc.kpi_semantic_cells
+            if item.col == header.col and item.row > header.row
+        ),
+        key=lambda item: item.row,
+    )
+    entries = [
+        KpiEntry(
+            display_value=item.display_value,
+            comparison_key=item.comparison_key,
+            coordinate=f"{index_to_column(item.col)}{item.row}",
+            row=item.row,
+            value_kind=item.value_kind,
+            confidence=item.confidence,
+        )
+        for item in body
+    ]
+    coordinates_by_key: dict[str, list[str]] = defaultdict(list)
+    for entry in entries:
+        if entry.comparison_key is not None:
+            coordinates_by_key[entry.comparison_key].append(entry.coordinate)
+    duplicates = {
+        key: coordinates
+        for key, coordinates in coordinates_by_key.items()
+        if len(coordinates) > 1
+    }
+    notes = [scan_note]
+    if body:
+        notes.append(
+            f"KPI entries were read below {header_coordinate} through row {body[-1].row:,}."
+        )
+    else:
+        notes.append(f"No nonblank semantic cells were found below {header_coordinate}.")
+    formula_cache_count = sum(item.value_kind.startswith("FORMULA_") for item in entries)
+    unresolved_count = sum(item.comparison_key is None for item in entries)
+    if formula_cache_count:
+        notes.append(
+            f"{formula_cache_count:,} KPI cell(s) use stored formula results; these are not recalculated."
+        )
+    if unresolved_count:
+        notes.append(
+            f"{unresolved_count:,} KPI cell(s) could not produce a comparable identifier."
+        )
+    return KpiColumnSnapshot(
+        status="FOUND",
+        header_coordinate=header_coordinate,
+        header_candidates=candidate_coordinates,
+        entries=entries,
+        duplicate_keys=duplicates,
+        notes=notes,
+    )
+
+
 def _parse_cell(
     cell: ET.Element,
     row: int,
@@ -542,6 +908,30 @@ def _parse_cell(
         inline_value = _rich_text(inline_element)
 
     has_formula = formula_element is not None
+    coordinate = f"{index_to_column(col)}{row}"
+    cached_ref_error = cell_type == "e" and _normalize_text(raw_value or "") == "#ref!"
+    formula_ref_error = formula is not None and _formula_contains_ref_error(formula)
+    _record_ref_errors(
+        acc,
+        coordinate,
+        cached_error=cached_ref_error,
+        formula_error=formula_ref_error,
+    )
+    if acc.capture_kpi:
+        _capture_kpi_semantic_cell(
+            acc,
+            _semantic_cell(
+                row=row,
+                col=col,
+                cell_type=cell_type,
+                has_formula=has_formula,
+                cache_present=value_element is not None or inline_element is not None,
+                raw_value=raw_value,
+                inline_value=inline_value,
+                shared_strings=shared_strings,
+            ),
+        )
+
     has_content = has_formula or raw_value is not None or inline_value is not None
     # A default-style empty <c> is serialization noise, not a materialized
     # row/column.  Styled blanks, on the other hand, are template evidence.
@@ -770,7 +1160,10 @@ def _parse_worksheet(
     if part_name not in archive.namelist():
         raise WorkbookReadError(f"Worksheet {name!r} points to missing part {part_name!r}.")
 
-    acc = _SheetAccumulator()
+    acc = _SheetAccumulator(
+        capture_kpi=_normalize_text(name) == "kpi",
+        kpi_semantic_cell_limit=config.max_kpi_semantic_cells,
+    )
     current_row = 0
     in_row = False
     next_row = 1
@@ -973,10 +1366,23 @@ def _parse_worksheet(
         styled_blank_cells=acc.styled_blank_count,
         merged_ranges=acc.merged_count,
         table_ranges=acc.table_count,
+        ref_error_count=acc.ref_error_count,
+        cached_ref_error_count=acc.cached_ref_error_count,
+        formula_ref_error_count=acc.formula_ref_error_count,
         active_ref=format_active_ref(acc.active_max_row, acc.active_max_column),
         content_ref=content_ref,
         declared_dimension=acc.declared_dimension,
     )
+    for label, count, coordinates in (
+        ("#REF!", acc.ref_error_count, acc.ref_error_coordinates),
+        ("cached #REF!", acc.cached_ref_error_count, acc.cached_ref_error_coordinates),
+        ("formula #REF!", acc.formula_ref_error_count, acc.formula_ref_error_coordinates),
+    ):
+        if count > len(coordinates):
+            acc.warnings.append(
+                f"Only the first {_REF_ERROR_COORDINATE_LIMIT:,} {label} cell coordinates "
+                f"were retained out of {count:,}."
+            )
     return SheetStructure(
         name=name,
         index=index,
@@ -987,6 +1393,10 @@ def _parse_worksheet(
         rows=rows,
         columns=columns,
         cell_anchors=dict(acc.cell_anchors),
+        kpi_snapshot=_kpi_snapshot(acc, config.kpi_header_scan_rows),
+        ref_error_coordinates=list(acc.ref_error_coordinates),
+        cached_ref_error_coordinates=list(acc.cached_ref_error_coordinates),
+        formula_ref_error_coordinates=list(acc.formula_ref_error_coordinates),
         warnings=acc.warnings,
     )
 
@@ -1008,6 +1418,14 @@ def _empty_nonworksheet(
         rows=[],
         columns=[],
         cell_anchors={},
+        kpi_snapshot=KpiColumnSnapshot(
+            status="NOT_APPLICABLE",
+            notes=(
+                ["A sheet normalized as 'KPI' is not a worksheet."]
+                if _normalize_text(name) == "kpi"
+                else []
+            ),
+        ),
     )
 
 

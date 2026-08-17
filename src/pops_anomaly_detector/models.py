@@ -34,6 +34,37 @@ class AxisOperation:
 
 
 @dataclass(slots=True)
+class KpiEntry:
+    display_value: str
+    comparison_key: str | None
+    coordinate: str
+    row: int
+    value_kind: str
+    confidence: str
+
+
+@dataclass(slots=True)
+class KpiColumnSnapshot:
+    status: str
+    header_coordinate: str | None = None
+    header_candidates: list[str] = field(default_factory=list)
+    entries: list[KpiEntry] = field(default_factory=list)
+    duplicate_keys: dict[str, list[str]] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class KpiComparison:
+    status: str
+    sent: KpiColumnSnapshot | None = None
+    received: KpiColumnSnapshot | None = None
+    missing_count: int = 0
+    unexpected_count: int = 0
+    reordered_count: int = 0
+    anomaly_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class SheetMetrics:
     active_rows: int = 0
     active_columns: int = 0
@@ -44,6 +75,9 @@ class SheetMetrics:
     styled_blank_cells: int = 0
     merged_ranges: int = 0
     table_ranges: int = 0
+    ref_error_count: int = 0
+    cached_ref_error_count: int = 0
+    formula_ref_error_count: int = 0
     active_ref: str | None = None
     content_ref: str | None = None
     declared_dimension: str | None = None
@@ -60,6 +94,7 @@ class SheetComparison:
     received_type: str | None
     sent_metrics: SheetMetrics | None
     received_metrics: SheetMetrics | None
+    kpi_comparison: KpiComparison | None = None
     row_operations: list[AxisOperation] = field(default_factory=list)
     column_operations: list[AxisOperation] = field(default_factory=list)
     alignment_notes: list[str] = field(default_factory=list)
@@ -95,6 +130,13 @@ class CountryMetrics:
     rows_deleted: int = 0
     columns_added: int = 0
     columns_deleted: int = 0
+    sent_ref_errors: int = 0
+    received_ref_errors: int = 0
+    kpi_sent_count: int = 0
+    kpi_received_count: int = 0
+    kpi_missing_count: int = 0
+    kpi_unexpected_count: int = 0
+    sheet_names_match: bool = True
     finding_count: int = 0
 
     @property
@@ -120,6 +162,8 @@ class CountryResult:
     max_anomaly_severity: str | None
     sent_file: FileEvidence | None
     received_file: FileEvidence | None
+    sent_sheet_names: list[str] = field(default_factory=list)
+    received_sheet_names: list[str] = field(default_factory=list)
     metrics: CountryMetrics = field(default_factory=CountryMetrics)
     sheets: list[SheetComparison] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
@@ -138,6 +182,7 @@ class RunSummary:
     unexpected_received: int = 0
     comparison_failed: int = 0
     high_findings: int = 0
+    medium_findings: int = 0
     affected_countries: int = 0
 
 
@@ -156,6 +201,12 @@ class RunResult:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        category_definitions = (
+            ("STRUCTURAL", "Structural anomalies", "HIGH"),
+            ("KPI_INTEGRITY", "KPI integrity anomalies", "HIGH"),
+            ("FORMULA_INTEGRITY", "Formula integrity anomalies", "HIGH"),
+        )
+        severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
         for serialized, country in zip(payload["countries"], self.countries, strict=True):
             serialized["report_href"] = f"countries/{country.report_filename}"
             serialized["metrics"].update(
@@ -165,13 +216,22 @@ class RunResult:
                     "column_net_delta": country.metrics.column_net_delta,
                 }
             )
-            serialized["category_results"] = [
-                {
-                    "code": "STRUCTURAL",
-                    "label": "Structural anomalies",
-                    "severity": "HIGH",
-                    "status": "ERROR" if country.findings else "OK",
-                    "finding_count": len(country.findings),
-                }
-            ]
+            category_results: list[dict[str, Any]] = []
+            for code, label, default_severity in category_definitions:
+                findings = [item for item in country.findings if item.category == code]
+                severity = max(
+                    (item.severity for item in findings),
+                    key=lambda item: severity_rank.get(item, 0),
+                    default=default_severity,
+                )
+                category_results.append(
+                    {
+                        "code": code,
+                        "label": label,
+                        "severity": severity,
+                        "status": "ERROR" if findings else "OK",
+                        "finding_count": len(findings),
+                    }
+                )
+            serialized["category_results"] = category_results
         return payload

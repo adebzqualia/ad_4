@@ -1,10 +1,10 @@
-# POPS structural anomaly detector
+# POPS workbook anomaly detector
 
 This project compares each POPS workbook sent to a country with the workbook
 received back under the same filename. It produces a self-contained HTML report
 for every country and a global dashboard.
 
-Version 0.1 checks one anomaly category:
+Version 0.2 checks three anomaly categories:
 
 - **Structural anomalies — HIGH**
   - sheets added or deleted;
@@ -12,10 +12,22 @@ Version 0.1 checks one anomaly category:
   - columns inferred added or deleted;
   - sheet type changes;
   - structures that cannot be aligned reliably and therefore require review.
+- **KPI integrity anomalies**
+  - missing or unexpected identifiers in the column headed `KPI` on the `KPI`
+    sheet — **HIGH**;
+  - missing, ambiguous, or non-comparable KPI identifiers — **HIGH**;
+  - order-only KPI changes when membership and duplicate counts still match —
+    **MEDIUM**.
+- **Formula integrity anomalies — HIGH**
+  - an increase in stored or explicit `#REF!` cells. Counts for sent and
+    received are always shown per sheet, including their cached-error and
+    formula-token components.
 
-Values, formula edits, formatting edits, hidden/unhidden rows, and changed row
-heights or column widths are deliberately not reported as anomalies yet. They
-are used only as supporting evidence for row and column alignment.
+Generic value changes, generic formula changes, formatting edits,
+hidden/unhidden rows, and changed row heights or column widths are deliberately
+not reported as anomalies yet. They are used only as supporting evidence for
+row and column alignment. KPI identifiers and explicit `#REF!` errors are the
+two intentional semantic exceptions in this version.
 
 ## Quick start
 
@@ -75,6 +87,8 @@ contain sensitive country data.
 --max-active-rows N          default: 100000
 --max-active-columns N       default: 16384
 --max-cells-per-sheet N      default: 5000000
+--kpi-header-scan-rows N     default: 200
+--max-kpi-semantic-cells N   default: 250000
 --alignment-band N           default: 240
 --always-zero                return 0 even when the report contains ERROR files
 ```
@@ -133,10 +147,23 @@ an input workbook. It:
    Contradictory evidence—often caused by “insert cells down/right” in only part
    of a sheet—is reported as `STRUCTURE_UNRESOLVED`, not as a fictitious whole
    row or column edit.
+8. on the sheet whose normalized name is exactly `KPI`, locates one literal
+   `KPI` header within the configured header scan, reads every nonblank stored
+   scalar below it (without stopping at internal blanks), and compares typed,
+   normalized identifier sequences with duplicate multiplicity preserved;
+9. counts a cell once when it stores the Excel error `#REF!`, its formula
+   contains an unquoted `#REF!` token, or both. Text values and quoted formula
+   text such as `IFERROR(A1,"#REF!")` are not counted.
 
 Every confirmed/inferred structural finding has severity `HIGH`. Confidence is
 reported separately as `HIGH`, `MEDIUM`, or `LOW` and reflects positional
 evidence, not business impact.
+
+KPI values are type-aware: numeric `1` and `1.0` match, while text `"1"` is a
+different identifier. Literal values have high evidence confidence. A formula
+result is used only when the workbook stores a scalar cache and is labelled
+medium-confidence; an absent or error cache produces a HIGH unresolved finding
+instead of being guessed.
 
 ## Important limits
 
@@ -149,6 +176,13 @@ Some histories are mathematically indistinguishable from the final `.xlsx`:
 - if formulas, values, labels, and structure are all rebuilt, too few anchors
   may survive to prove a global map;
 - a local rectangular cell shift is not a whole-row or whole-column edit.
+- a read-only OOXML parser does not calculate formulas, follow external links,
+  or discover errors that Excel would create only during recalculation;
+- a formula whose `#REF!` text appears only through a shared-formula follower
+  may require its stored error cache to be visible at that cell;
+- when the KPI sheet contains zero or multiple literal `KPI` header candidates
+  in the configured scan region, the comparison is marked unresolved rather
+  than choosing a column heuristically.
 
 The detector handles these conservatively. It explains weak evidence, or marks
 the sheet unresolved and the country `ERROR`, rather than declaring an
@@ -169,7 +203,9 @@ python -m unittest discover -s tests -v
 
 The cases cover sheet operations, middle and boundary row/column operations,
 net-zero combinations, simultaneous row and column edits, content-only changes,
-stale worksheet dimensions, missing/unexpected files, and report generation.
+stale worksheet dimensions, exact sheet-name inventories, KPI membership,
+duplicates, ordering and unresolved values, `#REF!` lexical edge cases,
+missing/unexpected files, report filtering, and report generation.
 
 ## Project layout
 
@@ -182,4 +218,3 @@ src/pops_anomaly_detector/
   cli.py            command-line interface
 tests/               synthetic OOXML fixtures and regression tests
 ```
-

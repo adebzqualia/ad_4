@@ -89,7 +89,7 @@ class StructuralDetectorTests(unittest.TestCase):
     def test_unchanged_workbook_is_ok(self) -> None:
         grid = make_grid()
 
-        run, country = self._pair({"KPI": grid}, {"KPI": grid})
+        run, country = self._pair({"Data": grid}, {"Data": grid})
 
         self.assertEqual(country.overall_status, "OK")
         self.assertEqual(country.comparison_state, "PAIRED")
@@ -125,7 +125,7 @@ class StructuralDetectorTests(unittest.TestCase):
                 sent = replace_cell(sent, row, column, sent_value)
                 received = replace_cell(received, row, column, received_value)
 
-        _run, country = self._pair({"KPI": sent}, {"KPI": received})
+        _run, country = self._pair({"Data": sent}, {"Data": received})
 
         axis_codes = {
             "ROWS_INSERTED",
@@ -141,13 +141,13 @@ class StructuralDetectorTests(unittest.TestCase):
         self.assertEqual(country.overall_status, "OK")
 
     def test_sheet_addition_and_deletion_are_both_reported(self) -> None:
-        kpi = make_grid(prefix="kpi")
+        overview = make_grid(prefix="overview")
         data = make_grid(prefix="data")
         forecast = make_grid(prefix="forecast")
 
         _run, country = self._pair(
-            {"KPI": kpi, "Data": data},
-            {"KPI": kpi, "Forecast": forecast},
+            {"Overview": overview, "Data": data},
+            {"Overview": overview, "Forecast": forecast},
         )
 
         self.assertEqual(
@@ -164,7 +164,7 @@ class StructuralDetectorTests(unittest.TestCase):
         baseline = make_grid(rows=9, columns=6)
         received = insert_row(baseline, 4)
 
-        _run, country = self._pair({"KPI": baseline}, {"KPI": received})
+        _run, country = self._pair({"Data": baseline}, {"Data": received})
 
         finding = self._finding(country, "ROWS_INSERTED")
         self.assertEqual((finding.start, finding.end), (4, 4))
@@ -178,7 +178,7 @@ class StructuralDetectorTests(unittest.TestCase):
         baseline = make_grid(rows=9, columns=6)
         received = delete_row(baseline, 4)
 
-        _run, country = self._pair({"KPI": baseline}, {"KPI": received})
+        _run, country = self._pair({"Data": baseline}, {"Data": received})
 
         finding = self._finding(country, "ROWS_DELETED")
         self.assertEqual((finding.start, finding.end), (4, 4))
@@ -192,7 +192,7 @@ class StructuralDetectorTests(unittest.TestCase):
         baseline = make_grid(rows=9, columns=7)
         received = insert_column(baseline, 3)
 
-        _run, country = self._pair({"KPI": baseline}, {"KPI": received})
+        _run, country = self._pair({"Data": baseline}, {"Data": received})
 
         finding = self._finding(country, "COLUMNS_INSERTED")
         self.assertEqual((finding.start, finding.end), (3, 3))
@@ -206,7 +206,7 @@ class StructuralDetectorTests(unittest.TestCase):
         baseline = make_grid(rows=9, columns=7)
         received = delete_column(baseline, 3)
 
-        _run, country = self._pair({"KPI": baseline}, {"KPI": received})
+        _run, country = self._pair({"Data": baseline}, {"Data": received})
 
         finding = self._finding(country, "COLUMNS_DELETED")
         self.assertEqual((finding.start, finding.end), (3, 3))
@@ -220,7 +220,7 @@ class StructuralDetectorTests(unittest.TestCase):
         baseline = make_grid(rows=10, columns=6)
         received = insert_row(delete_row(baseline, 3), 7)
 
-        _run, country = self._pair({"KPI": baseline}, {"KPI": received})
+        _run, country = self._pair({"Data": baseline}, {"Data": received})
 
         deleted = self._finding(country, "ROWS_DELETED")
         inserted = self._finding(country, "ROWS_INSERTED")
@@ -235,7 +235,7 @@ class StructuralDetectorTests(unittest.TestCase):
         baseline = make_grid(rows=9, columns=7)
         received = insert_column(insert_row(baseline, 4), 3)
 
-        _run, country = self._pair({"KPI": baseline}, {"KPI": received})
+        _run, country = self._pair({"Data": baseline}, {"Data": received})
 
         row_finding = self._finding(country, "ROWS_INSERTED")
         column_finding = self._finding(country, "COLUMNS_INSERTED")
@@ -265,7 +265,7 @@ class StructuralDetectorTests(unittest.TestCase):
                 style="accent",
             )
 
-        _run, country = self._pair({"KPI": baseline}, {"KPI": received})
+        _run, country = self._pair({"Data": baseline}, {"Data": received})
 
         codes = {finding.code for finding in country.findings}
         self.assertIn("STRUCTURE_UNRESOLVED", codes)
@@ -279,10 +279,10 @@ class StructuralDetectorTests(unittest.TestCase):
         baseline = make_grid(rows=8, columns=6)
 
         _run, country = self._pair(
-            {"KPI": baseline},
-            {"KPI": baseline},
-            sent_options={"dimensions": {"KPI": "A1:F8"}},
-            received_options={"dimensions": {"KPI": "A1:XFD1048576"}},
+            {"Data": baseline},
+            {"Data": baseline},
+            sent_options={"dimensions": {"Data": "A1:F8"}},
+            received_options={"dimensions": {"Data": "A1:XFD1048576"}},
         )
 
         self.assertEqual(country.overall_status, "OK")
@@ -301,8 +301,8 @@ class StructuralDetectorTests(unittest.TestCase):
         baseline = make_grid(rows=8, columns=6)
 
         _run, country = self._pair(
-            {"KPI": baseline},
-            {"KPI": baseline},
+            {"Data": baseline},
+            {"Data": baseline},
             received_options={
                 "empty_default_cell": "A50000",
                 "full_column_format": True,
@@ -319,8 +319,8 @@ class StructuralDetectorTests(unittest.TestCase):
         baseline = make_grid(rows=8, columns=6)
 
         _run, country = self._pair(
-            {"KPI": baseline},
-            {"KPI": baseline},
+            {"Data": baseline},
+            {"Data": baseline},
             sent_options={
                 "use_shared_strings": True,
                 "style_order": STYLE_KEYS,
@@ -344,8 +344,8 @@ class StructuralDetectorTests(unittest.TestCase):
             received_dir = root / "received"
             sent_dir.mkdir()
             received_dir.mkdir()
-            write_xlsx(sent_dir / "Missing.xlsx", {"KPI": make_grid()})
-            write_xlsx(received_dir / "Unexpected.xlsx", {"KPI": make_grid()})
+            write_xlsx(sent_dir / "Missing.xlsx", {"Data": make_grid()})
+            write_xlsx(received_dir / "Unexpected.xlsx", {"Data": make_grid()})
 
             run = analyze_directories(
                 AnalysisConfig(
@@ -377,8 +377,8 @@ class StructuralDetectorTests(unittest.TestCase):
             sent_dir.mkdir()
             received_dir.mkdir()
             baseline = make_grid()
-            write_xlsx(sent_dir / "France.xlsx", {"KPI": baseline})
-            write_xlsx(received_dir / "France.xlsx", {"KPI": insert_row(baseline, 4)})
+            write_xlsx(sent_dir / "France.xlsx", {"Data": baseline})
+            write_xlsx(received_dir / "France.xlsx", {"Data": insert_row(baseline, 4)})
             run = analyze_directories(
                 AnalysisConfig(
                     sent_dir=sent_dir,

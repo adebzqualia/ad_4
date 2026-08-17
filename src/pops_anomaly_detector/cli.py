@@ -24,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pops-anomaly",
         description=(
             "Compare paired sent/received POPS .xlsx files and generate auditable "
-            "HTML structural-anomaly reports."
+            "HTML anomaly reports."
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-active-rows", type=_positive_int, default=100_000)
     parser.add_argument("--max-active-columns", type=_positive_int, default=16_384)
     parser.add_argument("--max-cells-per-sheet", type=_positive_int, default=5_000_000)
+    parser.add_argument("--kpi-header-scan-rows", type=_positive_int, default=200)
+    parser.add_argument("--max-kpi-semantic-cells", type=_positive_int, default=250_000)
     parser.add_argument("--alignment-band", type=_positive_int, default=240)
     parser.add_argument(
         "--always-zero",
@@ -58,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
         max_active_rows=args.max_active_rows,
         max_active_columns=args.max_active_columns,
         max_cells_per_sheet=args.max_cells_per_sheet,
+        kpi_header_scan_rows=args.kpi_header_scan_rows,
+        max_kpi_semantic_cells=args.max_kpi_semantic_cells,
         alignment_band=args.alignment_band,
     )
     try:
@@ -72,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"Sent {summary.sent_files} | received {summary.received_files} | "
         f"matched {summary.matched_pairs} | OK {summary.ok} | ERROR {summary.error} | "
-        f"HIGH findings {summary.high_findings}"
+        f"HIGH findings {summary.high_findings} | MEDIUM findings {summary.medium_findings}"
     )
     if not run.countries:
         print("ERROR: no .xlsx files were found in either input directory.", file=sys.stderr)
@@ -84,4 +88,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-

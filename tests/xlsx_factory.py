@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence, TypeAlias
+from typing import Literal, Mapping, Sequence, TypeAlias
 from xml.etree import ElementTree as ET
 import zipfile
 
@@ -46,6 +46,7 @@ class Cell:
     value: Scalar | None = None
     formula: str | None = None
     style: str = "default"
+    data_type: Literal["auto", "e"] = "auto"
 
 
 CellLike: TypeAlias = Cell | Scalar | None
@@ -108,6 +109,48 @@ def make_grid(rows: int = 8, columns: int = 6, prefix: str = "anchor") -> Matrix
         ]
         for row in range(1, rows + 1)
     ]
+
+
+def make_kpi_sheet(
+    kpis: Sequence[CellLike],
+    *,
+    header_row: int = 3,
+    kpi_column: int = 3,
+    header: CellLike = "KPI",
+    columns: int = 5,
+) -> Matrix:
+    """Return a dense KPI worksheet with stable context around its KPI column.
+
+    The surrounding populated cells are intentional.  They let tests exercise
+    blank KPI identifiers, value replacements, and header edits without those
+    content changes also looking like physical row or column operations.
+    """
+
+    if header_row < 1 or kpi_column < 1:
+        raise ValueError("KPI header coordinates are one-based.")
+    width = max(columns, kpi_column)
+    result = make_grid(
+        rows=header_row + len(kpis),
+        columns=width,
+        prefix="kpi-context",
+    )
+    result[header_row - 1][kpi_column - 1] = _as_cell(header)
+    for offset, value in enumerate(kpis, start=1):
+        result[header_row + offset - 1][kpi_column - 1] = _as_cell(value)
+    return result
+
+
+def error_cell(
+    value: str = "#REF!",
+    *,
+    formula: str | None = None,
+    style: str = "default",
+) -> Cell:
+    """Return an OOXML error-typed cell, optionally with a formula/cache pair."""
+
+    if not value.startswith("#"):
+        raise ValueError("Excel error values must start with '#'.")
+    return Cell(value=value, formula=formula, style=style, data_type="e")
 
 
 def replace_cell(
@@ -344,7 +387,12 @@ def _shared_string_values(sheets: Sequence[tuple[str, Matrix]]) -> list[str]:
     for _name, rows in sheets:
         for row in rows:
             for cell in row:
-                if cell.formula is None and isinstance(cell.value, str) and cell.value not in seen:
+                if (
+                    cell.data_type == "auto"
+                    and cell.formula is None
+                    and isinstance(cell.value, str)
+                    and cell.value not in seen
+                ):
                     seen.add(cell.value)
                     values.append(cell.value)
     return values
@@ -395,7 +443,9 @@ def _worksheet(
                 "r": f"{column_name(column_index)}{row_index}",
                 "s": str(style_ids[cell.style]),
             }
-            if cell.formula is None and isinstance(cell.value, str):
+            if cell.data_type == "e":
+                attributes["t"] = "e"
+            elif cell.formula is None and isinstance(cell.value, str):
                 attributes["t"] = "s" if shared_string_ids is not None else "inlineStr"
             elif cell.formula is None and isinstance(cell.value, bool):
                 attributes["t"] = "b"
@@ -405,7 +455,11 @@ def _worksheet(
             if cell.formula is not None:
                 formula = ET.SubElement(element, _tag(SPREADSHEET_NS, "f"))
                 formula.text = cell.formula
-            if cell.formula is None and isinstance(cell.value, str):
+            if (
+                cell.data_type == "auto"
+                and cell.formula is None
+                and isinstance(cell.value, str)
+            ):
                 if shared_string_ids is not None:
                     value = ET.SubElement(element, _tag(SPREADSHEET_NS, "v"))
                     value.text = str(shared_string_ids[cell.value])
@@ -459,7 +513,9 @@ def write_xlsx(
         strings.reverse()
     string_ids = {value: index for index, value in enumerate(strings)} if use_shared_strings else None
     occurrence_count = sum(
-        cell.formula is None and isinstance(cell.value, str)
+        cell.data_type == "auto"
+        and cell.formula is None
+        and isinstance(cell.value, str)
         for _name, rows in normalized
         for row in rows
         for cell in row

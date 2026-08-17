@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 from uuid import uuid4
 
+from .coordinates import index_to_column
 from .models import (
     AxisOperation,
     CountryResult,
@@ -42,6 +43,13 @@ _FINDING_LABELS = {
     "COLUMNS_INSERTED": "Columns added",
     "COLUMNS_DELETED": "Columns deleted",
     "STRUCTURE_UNRESOLVED": "Structure unresolved",
+    "KPI_HEADER_MISSING": "KPI header missing",
+    "KPI_HEADER_AMBIGUOUS": "KPI header ambiguous",
+    "KPI_IDENTIFIER_MISSING": "KPI missing",
+    "KPI_IDENTIFIER_UNEXPECTED": "Unexpected KPI",
+    "KPI_IDENTIFIER_UNRESOLVED": "KPI identifier unresolved",
+    "KPI_ORDER_CHANGED": "KPI order changed",
+    "REFERENCE_ERRORS_INCREASED": "#REF! errors increased",
 }
 
 _FINDING_ORDER = {
@@ -53,6 +61,34 @@ _FINDING_ORDER = {
     "COLUMNS_INSERTED": 60,
     "COLUMNS_DELETED": 70,
     "STRUCTURE_UNRESOLVED": 80,
+    "KPI_HEADER_MISSING": 110,
+    "KPI_HEADER_AMBIGUOUS": 120,
+    "KPI_IDENTIFIER_MISSING": 130,
+    "KPI_IDENTIFIER_UNEXPECTED": 140,
+    "KPI_IDENTIFIER_UNRESOLVED": 150,
+    "KPI_ORDER_CHANGED": 160,
+    "REFERENCE_ERRORS_INCREASED": 210,
+}
+
+_CATEGORY_LABELS = {
+    "STRUCTURAL": "Structural anomalies",
+    "KPI_INTEGRITY": "KPI integrity anomalies",
+    "FORMULA_INTEGRITY": "Formula integrity anomalies",
+}
+
+_CATEGORY_ORDER = {
+    "STRUCTURAL": 10,
+    "KPI_INTEGRITY": 20,
+    "FORMULA_INTEGRITY": 30,
+}
+
+_SEVERITY_ORDER = {
+    "CRITICAL": 0,
+    "HIGH": 10,
+    "MEDIUM": 20,
+    "WARNING": 30,
+    "LOW": 40,
+    "INFO": 50,
 }
 
 _CSS = r"""
@@ -128,6 +164,7 @@ summary:focus-visible, [tabindex]:focus-visible {
 .kpi { border-top: 3px solid #98a2b3; }
 .kpi--ok { border-top-color: var(--ok); }
 .kpi--error { border-top-color: var(--error); }
+.kpi--warn { border-top-color: var(--warn); }
 .kpi--accent { border-top-color: var(--accent); }
 .kpi__label { color: var(--muted); font-size: .82rem; font-weight: 700; text-transform: uppercase; letter-spacing: .035em; }
 .kpi__value { margin-top: .22rem; font-size: 1.65rem; font-weight: 780; font-variant-numeric: tabular-nums; line-height: 1.2; }
@@ -139,7 +176,7 @@ summary:focus-visible, [tabindex]:focus-visible {
 }
 .badge--ok { color: var(--ok); background: var(--ok-soft); }
 .badge--error, .badge--high { color: var(--error); background: var(--error-soft); }
-.badge--warn { color: var(--warn); background: var(--warn-soft); }
+.badge--warn, .badge--medium { color: var(--warn); background: var(--warn-soft); }
 .badge--info { color: #175cd3; background: var(--accent-soft); }
 .badge--neutral { color: #344054; background: #f2f4f7; }
 .notice { padding: .9rem 1rem; border: 1px solid var(--line); border-left-width: 5px; border-radius: .45rem; background: var(--surface); }
@@ -154,6 +191,7 @@ summary:focus-visible, [tabindex]:focus-visible {
   display: grid; grid-template-columns: minmax(220px, 2fr) minmax(180px, 1fr) auto;
   gap: .75rem; align-items: end; margin: 1rem 0;
 }
+.anomaly-toolbar { grid-template-columns: repeat(2, minmax(190px, 1fr)) auto auto; }
 .field label { display: block; margin-bottom: .3rem; color: var(--muted); font-size: .84rem; font-weight: 700; }
 .field input, .field select {
   width: 100%; min-height: 2.65rem; padding: .55rem .7rem; color: var(--ink); background: #fff;
@@ -180,15 +218,33 @@ tbody tr:hover { background: #fcfcfd; }
   padding: .45rem .75rem; border: 1px solid #84adff; border-radius: .4rem;
   color: #1849a9; background: #f5f8ff; font-weight: 700; text-decoration: none;
 }
+button.button-link { font: inherit; cursor: pointer; }
 .report-nav { margin: 0 0 1rem; }
 .report-nav__spacer { flex: 1; }
 .progress-card label { display: block; margin-bottom: .45rem; font-weight: 700; }
 progress { width: 100%; height: .75rem; accent-color: var(--accent); }
 .progress-card__text { margin: .45rem 0 0; color: var(--muted); }
-.finding-group + .finding-group { margin-top: 1.25rem; }
-.finding-group__title { padding-bottom: .45rem; border-bottom: 1px solid var(--line); }
+.anomaly-type {
+  margin-top: .75rem; overflow: hidden; background: var(--surface);
+  border: 1px solid var(--line); border-radius: .65rem; box-shadow: var(--shadow);
+}
+.anomaly-type > summary, .anomaly-sheet > summary {
+  width: 100%; padding: .78rem 1rem; color: var(--ink);
+}
+.anomaly-type > summary { background: #f9fafb; }
+.anomaly-type[open] > summary { border-bottom: 1px solid var(--line-soft); }
+.anomaly-type__summary-content, .anomaly-sheet__summary-content {
+  display: inline-flex; flex-wrap: wrap; gap: .45rem; align-items: center;
+  margin-left: .3rem;
+}
+.anomaly-type__body { padding: 0 1rem 1rem; }
+.anomaly-sheet { margin: .8rem 0 0; border: 1px solid var(--line-soft); border-radius: .5rem; }
+.anomaly-sheet > summary { background: #fcfcfd; }
+.anomaly-sheet > .finding-list { padding: 0 .8rem .8rem; }
 .finding-list { display: grid; gap: .7rem; margin-top: .7rem; }
 .finding { border-left: 5px solid var(--error); }
+.finding[data-severity="MEDIUM"], .finding[data-severity="WARNING"] { border-left-color: var(--warn); }
+.finding[data-severity="LOW"], .finding[data-severity="INFO"] { border-left-color: var(--accent); }
 .finding__top { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; }
 .finding__title { margin-right: auto; font-size: 1rem; }
 .finding__message { margin: .7rem 0; }
@@ -198,6 +254,30 @@ progress { width: 100%; height: .75rem; accent-color: var(--accent); }
 .evidence-list, .notes-list { margin: .45rem 0 0; padding-left: 1.2rem; }
 details { margin-top: .55rem; }
 summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700; }
+.sheet-evidence-row > td { padding: .35rem .8rem .8rem; background: #fcfcfd; }
+.sheet-evidence-row:hover { background: #fcfcfd; }
+.sheet-evidence { margin: 0; }
+.sheet-evidence .mini-dl { grid-template-columns: minmax(6rem, max-content) minmax(0, 1fr); }
+.sheet-evidence .mini-dl dd { overflow-wrap: break-word; word-break: normal; }
+.reference-errors { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.reference-errors--present { color: var(--error); font-weight: 700; }
+.sheet-inventory { padding: 0; }
+.sheet-inventory > summary { width: 100%; padding: 1rem; }
+.sheet-inventory[open] > summary { border-bottom: 1px solid var(--line-soft); }
+.sheet-inventory__summary { display: inline-flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-left: .3rem; }
+.sheet-inventory__body { padding: 1rem; }
+.inventory-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.inventory-panel { min-width: 0; padding: .8rem; border: 1px solid var(--line-soft); border-radius: .5rem; }
+.inventory-panel h3 { margin: 0 0 .5rem; }
+.inventory-list { margin: 0; padding-left: 2rem; }
+.inventory-list li { padding: .18rem 0; overflow-wrap: break-word; }
+.inventory-list li::marker { color: var(--subtle); font-variant-numeric: tabular-nums; }
+.inventory-name { margin-right: .4rem; }
+.kpi-evidence { margin-top: .7rem; padding-top: .65rem; border-top: 1px solid var(--line-soft); }
+.kpi-evidence h4 { margin: 0 0 .35rem; font-size: .95rem; }
+.kpi-entry-list { max-height: 18rem; overflow: auto; margin: .35rem 0 0; padding-left: 1.25rem; }
+.analysis-notes { margin-top: 0; }
+.analysis-notes > summary { width: 100%; }
 .operation-list { margin: .35rem 0 0; padding-left: 1.05rem; }
 .operation-list li + li { margin-top: .25rem; }
 .source-card h3 { margin-bottom: .65rem; }
@@ -217,7 +297,7 @@ summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700;
   .page { padding-top: 1.25rem; }
   .hero { display: block; }
   .hero__status { justify-content: flex-start; margin-top: .8rem; }
-  .two-col, .toolbar { grid-template-columns: 1fr; }
+  .two-col, .toolbar, .inventory-grid { grid-template-columns: 1fr; }
   .filter-count { min-height: auto; }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -242,6 +322,8 @@ summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700;
   .section { break-inside: auto; }
   .badge { color: #000 !important; background: #fff !important; border: 1.5px solid #000; }
   details:not([open]) > *:not(summary) { display: block !important; }
+  [data-finding][hidden], [data-sheet-group][hidden], [data-type-group][hidden],
+  .anomaly-category[hidden] { display: block !important; }
   summary { list-style: none; }
   summary::-webkit-details-marker { display: none; }
   a { color: #000; text-decoration: underline; }
@@ -270,6 +352,98 @@ _GLOBAL_FILTER_JS = r"""
   search.addEventListener('input', update);
   filter.addEventListener('change', update);
   update();
+})();
+"""
+
+_ANOMALY_FILTER_JS = r"""
+(() => {
+  const root = document.getElementById('anomaly-results');
+  const typeFilter = document.getElementById('anomaly-type-filter');
+  const severityFilter = document.getElementById('anomaly-severity-filter');
+  const reset = document.getElementById('anomaly-filter-reset');
+  const count = document.getElementById('anomaly-filter-count');
+  if (!root || !typeFilter || !severityFilter || !reset || !count) return;
+
+  const cards = Array.from(root.querySelectorAll('[data-finding]'));
+  const sheetGroups = Array.from(root.querySelectorAll('[data-sheet-group]'));
+  const typeGroups = Array.from(root.querySelectorAll('[data-type-group]'));
+  const categories = Array.from(root.querySelectorAll('.anomaly-category[data-category]'));
+
+  const update = () => {
+    const selectedType = typeFilter.value;
+    const selectedSeverity = severityFilter.value;
+    const filtering = selectedType !== 'ALL' || selectedSeverity !== 'ALL';
+    let visible = 0;
+
+    cards.forEach((card) => {
+      const typeMatches = selectedType === 'ALL' || card.dataset.type === selectedType;
+      const severityMatches = selectedSeverity === 'ALL' || card.dataset.severity === selectedSeverity;
+      card.hidden = !(typeMatches && severityMatches);
+      if (!card.hidden) visible += 1;
+    });
+
+    sheetGroups.forEach((group) => {
+      const groupCount = group.querySelectorAll('[data-finding]:not([hidden])').length;
+      group.hidden = groupCount === 0;
+      const output = group.querySelector('[data-sheet-visible-count]');
+      if (output) output.textContent = String(groupCount);
+      if (filtering && groupCount) group.open = true;
+    });
+
+    typeGroups.forEach((group) => {
+      const groupCount = group.querySelectorAll('[data-finding]:not([hidden])').length;
+      group.hidden = groupCount === 0;
+      const output = group.querySelector('[data-type-visible-count]');
+      if (output) output.textContent = String(groupCount);
+      if (filtering && groupCount) group.open = true;
+    });
+
+    categories.forEach((category) => {
+      const categoryCount = category.querySelectorAll('[data-finding]:not([hidden])').length;
+      category.hidden = filtering && categoryCount === 0;
+    });
+    count.textContent = `${visible} of ${cards.length} anomalies shown`;
+  };
+
+  const openAncestors = (target) => {
+    for (let node = target ? target.parentElement : null; node; node = node.parentElement) {
+      if (node instanceof HTMLDetailsElement) {
+        node.hidden = false;
+        node.open = true;
+      }
+      if (node.classList && node.classList.contains('anomaly-category')) node.hidden = false;
+    }
+  };
+
+  const revealHash = () => {
+    if (!window.location.hash) return;
+    const target = document.getElementById(decodeURIComponent(window.location.hash.slice(1)));
+    if (!target || !target.matches('[data-finding]')) return;
+    typeFilter.value = 'ALL';
+    severityFilter.value = 'ALL';
+    update();
+    openAncestors(target);
+  };
+
+  typeFilter.addEventListener('change', update);
+  severityFilter.addEventListener('change', update);
+  reset.addEventListener('click', () => {
+    typeFilter.value = 'ALL';
+    severityFilter.value = 'ALL';
+    update();
+    typeFilter.focus();
+  });
+  document.addEventListener('click', (event) => {
+    const link = event.target.closest ? event.target.closest('a[href^="#finding-"]') : null;
+    if (!link) return;
+    typeFilter.value = 'ALL';
+    severityFilter.value = 'ALL';
+    update();
+    openAncestors(document.getElementById(link.hash.slice(1)));
+  });
+  window.addEventListener('hashchange', revealHash);
+  update();
+  revealHash();
 })();
 """
 
@@ -355,7 +529,7 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def _badge(label: object, tone: str = "neutral", symbol: str | None = None) -> str:
-    allowed_tones = {"ok", "error", "high", "warn", "info", "neutral"}
+    allowed_tones = {"ok", "error", "high", "medium", "warn", "info", "neutral"}
     resolved_tone = tone if tone in allowed_tones else "neutral"
     symbol_html = f'<span aria-hidden="true">{_e(symbol)}</span>' if symbol else ""
     return f'<span class="badge badge--{resolved_tone}">{symbol_html}{_e(label)}</span>'
@@ -369,6 +543,8 @@ def _status_badge(status: str) -> str:
         return _badge(normalized, "error", "!")
     if normalized in {"MISSING_RECEIVED", "UNEXPECTED_RECEIVED", "READ_ERROR"}:
         return _badge(normalized.replace("_", " "), "warn", "!")
+    if normalized in {"WARNING", "WARN"}:
+        return _badge("WARNING", "warn", "!")
     if normalized == "PAIRED":
         return _badge("PAIRED", "info")
     return _badge(normalized.replace("_", " "))
@@ -378,11 +554,63 @@ def _severity_badge(severity: str | None) -> str:
     if not severity:
         return _badge("No anomaly severity", "neutral")
     normalized = severity.upper()
-    return _badge(normalized, "high" if normalized == "HIGH" else "warn", "!!" if normalized == "HIGH" else "!")
+    if normalized in {"CRITICAL", "HIGH"}:
+        return _badge(normalized, "high", "!!")
+    if normalized in {"MEDIUM", "WARNING"}:
+        return _badge(normalized, "medium", "!")
+    if normalized in {"LOW", "INFO"}:
+        return _badge(normalized, "info")
+    return _badge(normalized, "neutral")
+
+
+def _category_label(category: str) -> str:
+    normalized = category.upper()
+    return _CATEGORY_LABELS.get(normalized, normalized.replace("_", " ").title())
+
+
+def _severity_sort_key(severity: str) -> tuple[int, str]:
+    normalized = severity.upper()
+    return (_SEVERITY_ORDER.get(normalized, 999), normalized)
+
+
+def _maximum_severity(findings: Iterable[Finding]) -> str | None:
+    severities = {finding.severity.upper() for finding in findings if finding.severity}
+    return min(severities, key=_severity_sort_key) if severities else None
+
+
+def _category_results(country: CountryResult) -> list[dict[str, object]]:
+    grouped: dict[str, list[Finding]] = {"STRUCTURAL": []}
+    for finding in country.findings:
+        grouped.setdefault(finding.category.upper(), []).append(finding)
+    results: list[dict[str, object]] = []
+    for category in sorted(
+        grouped,
+        key=lambda value: (_CATEGORY_ORDER.get(value, 999), value),
+    ):
+        findings = grouped[category]
+        maximum = _maximum_severity(findings)
+        if maximum in {"CRITICAL", "HIGH"}:
+            status = "ERROR"
+        elif maximum in {"MEDIUM", "WARNING"}:
+            status = "WARNING"
+        elif findings:
+            status = "INFO"
+        else:
+            status = "OK"
+        results.append(
+            {
+                "code": category,
+                "label": _category_label(category),
+                "severity": maximum,
+                "status": status,
+                "finding_count": len(findings),
+            }
+        )
+    return results
 
 
 def _kpi(label: str, value: object, help_text: str, tone: str = "") -> str:
-    tone_class = f" kpi--{tone}" if tone in {"ok", "error", "accent"} else ""
+    tone_class = f" kpi--{tone}" if tone in {"ok", "error", "warn", "accent"} else ""
     return (
         f'<article class="card kpi{tone_class}">'
         f'<div class="kpi__label">{_e(label)}</div>'
@@ -403,6 +631,18 @@ def _notice(title: str, messages: Iterable[str], tone: str) -> str:
     )
 
 
+def _collapsible_notice(title: str, messages: Iterable[str], tone: str) -> str:
+    materialized = list(messages)
+    if not materialized:
+        return ""
+    items = "".join(f"<li>{_e(message)}</li>" for message in materialized)
+    return (
+        f'<details class="analysis-notes notice notice--{_e(tone)}">'
+        f'<summary>{_e(title)} ({len(materialized):,})</summary>'
+        f'<ul class="notes-list">{items}</ul></details>'
+    )
+
+
 def _document(title: str, body: str, script: str = "") -> str:
     script_html = f"<script>{script}</script>" if script else ""
     return (
@@ -420,20 +660,12 @@ def _country_payload(country: CountryResult, report_filename: str) -> dict[str, 
     payload = asdict(country)
     payload["report_filename"] = report_filename
     payload["report_href"] = f"countries/{report_filename}"
-    payload["category_results"] = [
-        {
-            "code": "STRUCTURAL",
-            "label": "Structural anomalies",
-            "severity": "HIGH",
-            "status": "ERROR" if country.findings else "OK",
-            "finding_count": len(country.findings),
-        }
-    ]
+    payload["category_results"] = _category_results(country)
     metrics = payload.get("metrics")
     if isinstance(metrics, dict):
-        metrics["row_net_delta"] = country.metrics.row_net_delta
-        metrics["column_net_delta"] = country.metrics.column_net_delta
-        metrics["sheet_net_delta"] = country.metrics.sheet_net_delta
+        metrics["row_net_delta"] = getattr(country.metrics, "row_net_delta", 0)
+        metrics["column_net_delta"] = getattr(country.metrics, "column_net_delta", 0)
+        metrics["sheet_net_delta"] = getattr(country.metrics, "sheet_net_delta", 0)
     return payload
 
 
@@ -457,21 +689,28 @@ def _unit_label(code: str, count: int) -> str:
         unit = "column"
     elif code.startswith("SHEET"):
         unit = "sheet"
+    elif code.startswith("KPI"):
+        unit = "KPI"
+    elif "REFERENCE_ERROR" in code or "REF_ERROR" in code:
+        unit = "cell"
     else:
         unit = "case"
     return f"{count:,} {unit if count == 1 else unit + 's'}"
 
 
-def _structural_rollups(run: RunResult) -> list[dict[str, object]]:
-    buckets: dict[str, dict[str, object]] = {}
+def _finding_rollups(run: RunResult) -> list[dict[str, object]]:
+    buckets: dict[tuple[str, str, str], dict[str, object]] = {}
     for country in run.countries:
         for finding in country.findings:
-            if finding.category.upper() != "STRUCTURAL":
-                continue
+            category = finding.category.upper()
+            severity = finding.severity.upper()
+            key = (category, finding.code, severity)
             bucket = buckets.setdefault(
-                finding.code,
+                key,
                 {
+                    "category": category,
                     "code": finding.code,
+                    "severity": severity,
                     "findings": 0,
                     "units": 0,
                     "countries": set(),
@@ -489,20 +728,27 @@ def _structural_rollups(run: RunResult) -> list[dict[str, object]]:
                 sheets.add((country.country_id, sheet_name))
     return sorted(
         buckets.values(),
-        key=lambda item: (_FINDING_ORDER.get(str(item["code"]), 999), str(item["code"])),
+        key=lambda item: (
+            _CATEGORY_ORDER.get(str(item["category"]), 999),
+            _FINDING_ORDER.get(str(item["code"]), 999),
+            _severity_sort_key(str(item["severity"])),
+            str(item["code"]),
+        ),
     )
 
 
 def _global_rollup_html(run: RunResult) -> str:
-    rollups = _structural_rollups(run)
+    rollups = _finding_rollups(run)
     if not rollups:
         return (
-            '<div class="notice notice--ok"><p class="notice__title">No structural findings</p>'
-            "<p>No HIGH structural anomalies were detected in the comparable workbooks.</p></div>"
+            '<div class="notice notice--ok"><p class="notice__title">No anomaly findings</p>'
+            "<p>No anomalies were detected in the comparable workbooks.</p></div>"
         )
     rows: list[str] = []
     for item in rollups:
         code = str(item["code"])
+        category = str(item["category"])
+        severity = str(item["severity"])
         countries = item["countries"]
         sheets = item["sheets"]
         country_count = len(countries) if isinstance(countries, set) else 0
@@ -511,19 +757,20 @@ def _global_rollup_html(run: RunResult) -> str:
         units = int(item["units"])
         rows.append(
             "<tr>"
+            f'<td>{_e(_category_label(category))}</td>'
             f'<th scope="row"><span class="cell-title">{_e(_finding_label(code))}</span>'
             f'<div class="cell-meta">{_e(code)}</div></th>'
             f'<td class="number">{findings:,}</td>'
             f'<td class="number">{_e(_unit_label(code, units))}</td>'
             f'<td class="number">{country_count:,}</td>'
             f'<td class="number">{sheet_count:,}</td>'
-            f"<td>{_severity_badge('HIGH')}</td>"
+            f"<td>{_severity_badge(severity)}</td>"
             "</tr>"
         )
     return (
-        '<div class="table-wrap" tabindex="0" role="region" aria-label="Structural anomaly roll-up">'
+        '<div class="table-wrap" tabindex="0" role="region" aria-label="Anomaly roll-up">'
         '<table><caption>Findings count operations or unresolved cases; affected units count rows, columns, or sheets.</caption>'
-        "<thead><tr><th scope=\"col\">Type</th><th scope=\"col\">Findings</th>"
+        "<thead><tr><th scope=\"col\">Category</th><th scope=\"col\">Type</th><th scope=\"col\">Findings</th>"
         "<th scope=\"col\">Affected units</th><th scope=\"col\">Countries</th>"
         "<th scope=\"col\">Sheets</th><th scope=\"col\">Severity</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table></div>"
@@ -545,12 +792,18 @@ def _global_country_rows(run: RunResult, filenames: Mapping[int, str]) -> str:
     for index, country in enumerate(run.countries):
         metrics = country.metrics
         high_count = sum(finding.severity.upper() == "HIGH" for finding in country.findings)
+        medium_count = sum(finding.severity.upper() == "MEDIUM" for finding in country.findings)
         comparable = country.comparison_state == "PAIRED"
         sent_name = country.sent_file.name if country.sent_file else "Not present"
         received_name = country.received_file.name if country.received_file else "Not present"
         if comparable:
             sheets = f"{metrics.sent_sheet_count:,} → {metrics.received_sheet_count:,}"
             sheet_meta = _operation_summary(metrics.sheets_added, metrics.sheets_deleted)
+            sheet_meta += (
+                "; names match exactly"
+                if getattr(metrics, "sheet_names_match", True)
+                else "; names differ"
+            )
             row_change = _operation_summary(metrics.rows_added, metrics.rows_deleted)
             column_change = _operation_summary(metrics.columns_added, metrics.columns_deleted)
         else:
@@ -566,7 +819,8 @@ def _global_country_rows(run: RunResult, filenames: Mapping[int, str]) -> str:
             f'<div class="cell-meta">Received: {_e(received_name)}</div></th>'
             f"<td>{_status_badge(country.overall_status)}<div class=\"cell-meta\">"
             f"{_status_badge(country.comparison_state)}</div></td>"
-            f'<td class="number">{high_count:,}</td>'
+            f'<td class="number">{high_count:,} HIGH'
+            f'<div class="cell-meta">{medium_count:,} MEDIUM</div></td>'
             f'<td><span class="number">{_e(sheets)}</span><div class="cell-meta">{_e(sheet_meta)}</div></td>'
             f'<td><span class="number">{_e(row_change)}</span></td>'
             f'<td><span class="number">{_e(column_change)}</span></td>'
@@ -598,7 +852,15 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
     summary = run.summary
     coverage_max = max(summary.sent_files, 1)
     quality_max = max(summary.matched_pairs, 1)
-    scope_text = ", ".join(item.lower() for item in run.scope) or "structural workbook evidence"
+    scope_labels = {
+        "SHEETS": "sheets",
+        "ROWS": "rows",
+        "COLUMNS": "columns",
+        "KPI_IDENTIFIERS": "KPI identifiers",
+        "REFERENCE_ERRORS": "#REF! reference errors",
+    }
+    scope_text = ", ".join(scope_labels.get(item, item.replace("_", " ").lower()) for item in run.scope)
+    scope_text = scope_text or "workbook evidence"
     notices = _notice("Run notes", run.warnings, "warn")
     body = f"""
 <header class="topbar">
@@ -610,9 +872,9 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
 <main id="main-content" class="page">
   <div class="hero">
     <div>
-      <p class="eyebrow">Structural integrity</p>
+      <p class="eyebrow">Workbook integrity</p>
       <h1>POPS global report</h1>
-      <p class="lede">Comparison of {summary.sent_files:,} sent and {summary.received_files:,} received workbooks. This run evaluates { _e(scope_text) }; values, formula correctness, and visual formatting are outside the current anomaly scope.</p>
+      <p class="lede">Comparison of {summary.sent_files:,} sent and {summary.received_files:,} received workbooks. This run evaluates {_e(scope_text)} where stored workbook evidence is available.</p>
     </div>
     <div class="hero__status" aria-label="Run status">
       {_status_badge('ERROR' if summary.error else 'OK')}
@@ -627,8 +889,9 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
       {_kpi('Received files', _number(summary.received_files), 'Returned country workbooks', 'accent')}
       {_kpi('Matched pairs', _number(summary.matched_pairs), 'Same filename on both sides', 'accent')}
       {_kpi('OK', _number(summary.ok), f'Of {summary.matched_pairs:,} matched comparisons', 'ok')}
-      {_kpi('ERROR', _number(summary.error), 'All structural and delivery errors', 'error' if summary.error else '')}
+      {_kpi('ERROR', _number(summary.error), 'Workbooks requiring action', 'error' if summary.error else '')}
       {_kpi('HIGH findings', _number(summary.high_findings), f'Across {summary.affected_countries:,} countries', 'error' if summary.high_findings else '')}
+      {_kpi('MEDIUM findings', _number(getattr(summary, 'medium_findings', 0)), 'Review recommended', 'warn' if getattr(summary, 'medium_findings', 0) else '')}
     </div>
   </section>
   <section class="section" aria-labelledby="coverage-heading">
@@ -647,8 +910,8 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
     </div>
   </section>
   <section class="section" aria-labelledby="rollup-heading">
-    <div class="section__heading"><h2 id="rollup-heading">Structural anomalies</h2>{_severity_badge('HIGH')}</div>
-    <p class="section-intro">Added and deleted units are counted independently. A workbook can therefore have a zero net dimension change and still contain HIGH structural anomalies.</p>
+    <div class="section__heading"><h2 id="rollup-heading">Anomalies by category and type</h2></div>
+    <p class="section-intro">Structural additions and deletions are counted independently. KPI and formula-integrity findings are reported separately with their own criticality.</p>
     {_global_rollup_html(run)}
   </section>
   <section class="section" aria-labelledby="countries-heading">
@@ -662,7 +925,7 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
     <div class="table-wrap" tabindex="0" role="region" aria-label="Country comparison results">
       <table id="country-results" class="global-table">
         <caption>One row per matched, missing, unexpected, or unreadable country workbook.</caption>
-        <thead><tr><th scope="col">Country / files</th><th scope="col">Result</th><th scope="col">HIGH findings</th><th scope="col">Sheets sent → received</th><th scope="col">Row operations</th><th scope="col">Column operations</th><th scope="col">Affected sheets</th><th scope="col"><span class="sr-only">Report link</span></th></tr></thead>
+        <thead><tr><th scope="col">Country / files</th><th scope="col">Result</th><th scope="col">Findings</th><th scope="col">Sheets sent → received</th><th scope="col">Row operations</th><th scope="col">Column operations</th><th scope="col">Affected sheets</th><th scope="col"><span class="sr-only">Report link</span></th></tr></thead>
         <tbody>{_global_country_rows(run, filenames)}</tbody>
       </table>
     </div>
@@ -675,7 +938,9 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
         <li>Active worksheet extents are derived from stored cells and structural evidence such as row or column properties, ranges, tables, and drawing anchors. Excel's declared dimension is retained as diagnostic evidence rather than trusted on its own.</li>
         <li>Inserted and deleted rows and columns are inferred by aligning structural signatures. Ambiguous mappings are surfaced as a HIGH manual-review finding instead of being silently treated as unchanged.</li>
         <li>Operation counts, not net deltas, determine structural status. Equal additions and deletions may leave the same final dimensions.</li>
-        <li>This report does not yet decide whether values, formulas, styles, charts, or business logic are correct.</li>
+        <li>The KPI sheet is checked for an identifiable KPI column and differences in normalized KPI identifiers and order.</li>
+        <li>#REF! counts include formula text and cached error cells; per-sheet evidence shows both components, which can overlap in the same cell.</li>
+        <li>Other changed values, formatting intent, charts, and broader business-rule validation remain outside this report's scope.</li>
       </ul>
     </div>
   </section>
@@ -685,9 +950,9 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
   </section>
   <p class="print-only">Run {_e(run.run_id)} · generated {_e(run.generated_at_utc)}</p>
 </main>
-<footer class="footer"><div class="footer__inner">POPS structural anomaly detector · Run <code>{_e(run.run_id)}</code> · Generated <time datetime="{_e(run.generated_at_utc)}">{_e(run.generated_at_utc)}</time></div></footer>
+<footer class="footer"><div class="footer__inner">POPS anomaly detector · Run <code>{_e(run.run_id)}</code> · Generated <time datetime="{_e(run.generated_at_utc)}">{_e(run.generated_at_utc)}</time></div></footer>
 """
-    return _document("POPS global structural report", body, _GLOBAL_FILTER_JS + _PRINT_DETAILS_JS)
+    return _document("POPS global anomaly report", body, _GLOBAL_FILTER_JS + _PRINT_DETAILS_JS)
 
 
 def render_global_report(run: RunResult) -> str:
@@ -716,11 +981,32 @@ def _file_card(label: str, evidence: FileEvidence | None) -> str:
 """
 
 
+def _axis_position(start: int, end: int, axis: str) -> str:
+    normalized = axis.upper()
+    if normalized == "COLUMN":
+        try:
+            first = index_to_column(start)
+            last = index_to_column(end)
+        except ValueError:
+            first = str(start)
+            last = str(end)
+    else:
+        first = str(start)
+        last = str(end)
+    return first if start == end else f"{first}–{last}"
+
+
 def _finding_location(finding: Finding) -> str:
     if finding.start is None:
         return "Not applicable"
     end = finding.end if finding.end is not None else finding.start
-    positions = str(finding.start) if end == finding.start else f"{finding.start}–{end}"
+    if finding.code.upper().startswith("COLUMN"):
+        axis = "COLUMN"
+    elif finding.code.upper().startswith("ROW"):
+        axis = "ROW"
+    else:
+        axis = "POSITION"
+    positions = _axis_position(finding.start, end, axis)
     coordinate = finding.coordinate_space.lower() if finding.coordinate_space else "unspecified"
     return f"{positions} ({coordinate} coordinates)"
 
@@ -730,12 +1016,15 @@ def _finding_card(finding: Finding, anchor: str) -> str:
     if finding.evidence:
         items = "".join(f"<li>{_e(item)}</li>" for item in finding.evidence)
         evidence = (
-            f'<details open><summary>Evidence ({len(finding.evidence):,})</summary>'
+            f'<details><summary>Evidence ({len(finding.evidence):,})</summary>'
             f'<ul class="evidence-list">{items}</ul></details>'
         )
     confidence_tone = "info" if finding.confidence.upper() == "HIGH" else "warn"
+    sheet_name = finding.sent_sheet_name or finding.received_sheet_name or "Workbook"
     return f"""
-<article id="{_e(anchor)}" class="card finding">
+<article id="{_e(anchor)}" class="card finding" data-finding
+  data-category="{_e(finding.category.upper())}" data-type="{_e(finding.code)}"
+  data-severity="{_e(finding.severity.upper())}" data-sheet="{_e(sheet_name)}">
   <div class="finding__top">
     <h4 class="finding__title">{_e(_finding_label(finding.code))}</h4>
     {_severity_badge(finding.severity)}
@@ -760,25 +1049,123 @@ def _finding_groups_html(
     empty_message: str,
 ) -> str:
     materialized = list(findings)
-    if not materialized:
-        return (
-            '<div class="notice notice--ok"><p class="notice__title">No structural findings</p>'
-            f"<p>{_e(empty_message)}</p></div>"
-        )
-    groups: OrderedDict[str, list[Finding]] = OrderedDict()
+    categories: dict[str, list[Finding]] = {"STRUCTURAL": []}
     for finding in materialized:
-        sheet_name = finding.sent_sheet_name or finding.received_sheet_name or "Workbook"
-        groups.setdefault(sheet_name, []).append(finding)
+        categories.setdefault(finding.category.upper(), []).append(finding)
     output: list[str] = []
-    for sheet_name, group in groups.items():
-        label = "Workbook" if sheet_name == "Workbook" else f"Sheet: {sheet_name}"
-        cards = "".join(_finding_card(item, anchors[id(item)]) for item in group)
+    for category, category_findings in sorted(
+        categories.items(),
+        key=lambda item: (_CATEGORY_ORDER.get(item[0], 999), item[0]),
+    ):
+        category_id = re.sub(r"[^a-z0-9]+", "-", category.casefold()).strip("-") or "other"
+        maximum = _maximum_severity(category_findings)
+        if category == "STRUCTURAL":
+            intro = (
+                "Added and deleted operations are independent, including when their net "
+                "effect on worksheet dimensions is zero."
+            )
+        elif category == "KPI_INTEGRITY":
+            intro = (
+                "The KPI identifier column is compared between the sent and received KPI "
+                "sheets, including missing, unexpected, ambiguous, and reordered identifiers."
+            )
+        elif category == "FORMULA_INTEGRITY":
+            intro = "Reference-error findings compare #REF! cells in sent and received sheets."
+        else:
+            intro = "Findings in this category are grouped by anomaly type and sheet."
+
+        if not category_findings:
+            category_body = (
+                '<div class="notice notice--ok"><p class="notice__title">No structural findings</p>'
+                f"<p>{_e(empty_message)}</p></div>"
+            )
+        else:
+            by_type: dict[str, list[Finding]] = {}
+            for finding in category_findings:
+                by_type.setdefault(finding.code, []).append(finding)
+            type_html: list[str] = []
+            for code, type_findings in sorted(
+                by_type.items(),
+                key=lambda item: (_FINDING_ORDER.get(item[0], 999), item[0]),
+            ):
+                sheets: OrderedDict[str, list[Finding]] = OrderedDict()
+                for finding in type_findings:
+                    sheet_name = (
+                        finding.sent_sheet_name or finding.received_sheet_name or "Workbook"
+                    )
+                    sheets.setdefault(sheet_name, []).append(finding)
+                sheet_html: list[str] = []
+                for sheet_name, sheet_findings in sheets.items():
+                    sheet_label = "Workbook" if sheet_name == "Workbook" else f"Sheet: {sheet_name}"
+                    cards = "".join(
+                        _finding_card(item, anchors[id(item)]) for item in sheet_findings
+                    )
+                    sheet_html.append(
+                        f'<details class="anomaly-sheet" data-sheet-group data-sheet="{_e(sheet_name)}">'
+                        '<summary><span class="anomaly-sheet__summary-content">'
+                        f'<span>{_e(sheet_label)}</span>'
+                        f'<span class="muted">(<span data-sheet-visible-count>{len(sheet_findings):,}</span>)</span>'
+                        f'{_severity_badge(_maximum_severity(sheet_findings))}'
+                        '</span></summary>'
+                        f'<div class="finding-list">{cards}</div></details>'
+                    )
+                severity_badges = "".join(
+                    _severity_badge(severity)
+                    for severity in sorted(
+                        {finding.severity.upper() for finding in type_findings},
+                        key=_severity_sort_key,
+                    )
+                )
+                type_html.append(
+                    f'<details class="anomaly-type" data-type-group data-type="{_e(code)}" open>'
+                    '<summary><span class="anomaly-type__summary-content">'
+                    f'<span>{_e(_finding_label(code))}</span>'
+                    f'<code>{_e(code)}</code>'
+                    f'<span class="muted">(<span data-type-visible-count>{len(type_findings):,}</span>)</span>'
+                    f'{severity_badges}</span></summary>'
+                    f'<div class="anomaly-type__body">{"".join(sheet_html)}</div></details>'
+                )
+            category_body = "".join(type_html)
+
+        heading_badge = _severity_badge(maximum) if maximum else _status_badge("OK")
         output.append(
-            '<section class="finding-group">'
-            f'<h3 class="finding-group__title">{_e(label)} <span class="muted">({len(group):,})</span></h3>'
-            f'<div class="finding-list">{cards}</div></section>'
+            f'<section id="category-{_e(category_id)}" class="section anomaly-category" '
+            f'data-category="{_e(category)}" aria-labelledby="category-{_e(category_id)}-heading">'
+            f'<div class="section__heading"><h2 id="category-{_e(category_id)}-heading">'
+            f'{_e(_category_label(category))}</h2>{heading_badge}</div>'
+            f'<p class="section-intro">{_e(intro)}</p>{category_body}</section>'
         )
     return "".join(output)
+
+
+def _anomaly_filters_html(findings: Iterable[Finding]) -> str:
+    materialized = list(findings)
+    if not materialized:
+        return ""
+    codes = sorted(
+        {finding.code for finding in materialized},
+        key=lambda code: (_FINDING_ORDER.get(code, 999), code),
+    )
+    severities = sorted(
+        {finding.severity.upper() for finding in materialized},
+        key=_severity_sort_key,
+    )
+    type_options = "".join(
+        f'<option value="{_e(code)}">{_e(_finding_label(code))}</option>' for code in codes
+    )
+    severity_options = "".join(
+        f'<option value="{_e(severity)}">{_e(severity)}</option>'
+        for severity in severities
+    )
+    return f"""
+<div id="anomaly-filters" class="toolbar anomaly-toolbar screen-only" role="search" aria-label="Filter anomalies">
+  <div class="field"><label for="anomaly-type-filter">Anomaly type</label><select id="anomaly-type-filter"><option value="ALL">All types</option>{type_options}</select></div>
+  <div class="field"><label for="anomaly-severity-filter">Criticality</label><select id="anomaly-severity-filter"><option value="ALL">All criticalities</option>{severity_options}</select></div>
+  <button id="anomaly-filter-reset" class="button-link" type="button">Reset filters</button>
+  <div id="anomaly-filter-count" class="filter-count" role="status" aria-live="polite">{len(materialized):,} of {len(materialized):,} anomalies shown</div>
+</div>
+<noscript><p class="notice notice--info">Anomaly filters require JavaScript. All anomalies remain visible below.</p></noscript>
+"""
 
 
 def _metric_html(metrics: SheetMetrics | None) -> str:
@@ -808,19 +1195,21 @@ def _extent_delta(comparison: SheetComparison) -> str:
     )
 
 
-def _axis_operation_text(operation: AxisOperation, axis_label: str) -> str:
+def _axis_operation_text(operation: AxisOperation, axis: str) -> str:
     verb = "Added" if operation.operation.upper() == "ADDED" else "Deleted"
     end = operation.end
-    position = str(operation.start) if operation.start == end else f"{operation.start}–{end}"
+    position = _axis_position(operation.start, end, axis)
+    unit = "row" if axis.upper() == "ROW" else "column"
+    unit_label = unit if operation.count == 1 else f"{unit}s"
     return (
-        f"{verb} {operation.count:,} {axis_label}; {position} in "
+        f"{verb} {operation.count:,} {unit_label} at {position}; "
         f"{operation.coordinate_space.lower()} coordinates; {operation.confidence.lower()} confidence"
     )
 
 
 def _axis_operations_html(
     operations: Iterable[AxisOperation],
-    axis_label: str,
+    axis: str,
     comparison_status: str,
 ) -> str:
     materialized = list(operations)
@@ -830,7 +1219,7 @@ def _axis_operations_html(
     added = sum(op.count for op in materialized if op.operation.upper() == "ADDED")
     deleted = sum(op.count for op in materialized if op.operation.upper() == "DELETED")
     items = "".join(
-        f"<li>{_e(_axis_operation_text(operation, axis_label))}</li>"
+        f"<li>{_e(_axis_operation_text(operation, axis))}</li>"
         for operation in materialized
     )
     return (
@@ -843,11 +1232,114 @@ def _metrics_evidence(label: str, metrics: SheetMetrics | None) -> str:
     if metrics is None:
         return f"<dt>{_e(label)}</dt><dd>Not present</dd>"
     declared = metrics.declared_dimension or "Not declared"
+    ref_total = int(getattr(metrics, "ref_error_count", getattr(metrics, "ref_error_cells", 0)))
+    cached = int(
+        getattr(metrics, "cached_ref_error_count", getattr(metrics, "cached_ref_error_cells", 0))
+    )
+    formula = int(
+        getattr(metrics, "formula_ref_error_count", getattr(metrics, "formula_ref_error_cells", 0))
+    )
     return (
         f"<dt>{_e(label)}</dt><dd>Declared {_e(declared)}; "
         f"{metrics.populated_cells:,} populated cells; {metrics.formula_cells:,} formulas; "
         f"{metrics.styled_blank_cells:,} styled blanks; {metrics.merged_ranges:,} merged ranges; "
-        f"{metrics.table_ranges:,} tables</dd>"
+        f"{metrics.table_ranges:,} tables; {ref_total:,} unique #REF! cells "
+        f"({cached:,} cached-error cells, {formula:,} formula-text cells)</dd>"
+    )
+
+
+def _reference_errors_html(comparison: SheetComparison) -> str:
+    sent_metrics = comparison.sent_metrics
+    received_metrics = comparison.received_metrics
+    sent = (
+        int(getattr(sent_metrics, "ref_error_count", getattr(sent_metrics, "ref_error_cells", 0)))
+        if sent_metrics is not None
+        else None
+    )
+    received = (
+        int(
+            getattr(
+                received_metrics,
+                "ref_error_count",
+                getattr(received_metrics, "ref_error_cells", 0),
+            )
+        )
+        if received_metrics is not None
+        else None
+    )
+    sent_text = "—" if sent is None else f"{sent:,}"
+    received_text = "—" if received is None else f"{received:,}"
+    present_class = " reference-errors--present" if received else ""
+    if sent is None or received is None:
+        delta = '<span class="cell-meta">Delta unavailable</span>'
+    else:
+        difference = received - sent
+        delta_class = " delta--changed" if difference else ""
+        delta = f'<span class="delta{delta_class}">Delta {_e(_signed(difference))}</span>'
+    return (
+        f'<span class="reference-errors{present_class}">Sent {sent_text} → '
+        f"Received {received_text}</span>{delta}"
+    )
+
+
+def _kpi_snapshot_html(label: str, snapshot: object | None) -> str:
+    if snapshot is None:
+        return f'<div class="inventory-panel"><h4>{_e(label)}</h4><p class="muted">Not available.</p></div>'
+    entries = list(getattr(snapshot, "entries", []) or [])
+    header = getattr(snapshot, "header_coordinate", None) or "Not resolved"
+    candidates = list(getattr(snapshot, "header_candidates", []) or [])
+    duplicates = dict(getattr(snapshot, "duplicate_keys", {}) or {})
+    notes = list(getattr(snapshot, "notes", []) or [])
+    candidate_text = ", ".join(str(item) for item in candidates) if candidates else "None"
+    duplicate_count = len(duplicates)
+    entry_items = "".join(
+        "<li>"
+        f'<code>{_e(getattr(entry, "coordinate", ""))}</code> '
+        f'{_e(getattr(entry, "display_value", ""))} '
+        f'<span class="muted">({_e(getattr(entry, "value_kind", "unknown"))}; '
+        f'{_e(getattr(entry, "confidence", "unspecified"))} confidence)</span></li>'
+        for entry in entries
+    )
+    entries_html = (
+        f'<details><summary>{_e(label)} KPI identifiers ({len(entries):,})</summary>'
+        f'<ol class="kpi-entry-list">{entry_items}</ol></details>'
+        if entries
+        else ""
+    )
+    notes_html = (
+        '<ul class="notes-list">'
+        + "".join(f"<li>{_e(note)}</li>" for note in notes)
+        + "</ul>"
+        if notes
+        else ""
+    )
+    return (
+        f'<div class="inventory-panel"><h4>{_e(label)}</h4><dl class="mini-dl">'
+        f'<dt>Status</dt><dd>{_e(getattr(snapshot, "status", "UNKNOWN"))}</dd>'
+        f'<dt>KPI header</dt><dd>{_e(header)}</dd>'
+        f'<dt>Header candidates</dt><dd>{_e(candidate_text)}</dd>'
+        f'<dt>Identifiers</dt><dd>{len(entries):,}</dd>'
+        f'<dt>Duplicate keys</dt><dd>{duplicate_count:,}</dd>'
+        f"</dl>{entries_html}{notes_html}</div>"
+    )
+
+
+def _kpi_comparison_html(comparison: SheetComparison) -> str:
+    kpi = getattr(comparison, "kpi_comparison", None)
+    if kpi is None:
+        return ""
+    sent = getattr(kpi, "sent", None)
+    received = getattr(kpi, "received", None)
+    return (
+        '<div class="kpi-evidence"><h4>KPI identifier comparison</h4>'
+        '<dl class="mini-dl">'
+        f'<dt>Status</dt><dd>{_e(getattr(kpi, "status", "UNKNOWN"))}</dd>'
+        f'<dt>Missing</dt><dd>{int(getattr(kpi, "missing_count", 0)):,}</dd>'
+        f'<dt>Unexpected</dt><dd>{int(getattr(kpi, "unexpected_count", 0)):,}</dd>'
+        f'<dt>Reordered</dt><dd>{int(getattr(kpi, "reordered_count", 0)):,}</dd>'
+        "</dl><div class=\"inventory-grid\">"
+        f"{_kpi_snapshot_html('Sent', sent)}{_kpi_snapshot_html('Received', received)}"
+        "</div></div>"
     )
 
 
@@ -859,11 +1351,11 @@ def _sheet_evidence_html(comparison: SheetComparison) -> str:
         ) + "</ul>"
     open_attr = " open" if comparison.status.upper() != "UNCHANGED" else ""
     return (
-        f"<details{open_attr}><summary>Sheet evidence</summary>"
+        f'<details class="sheet-evidence"{open_attr}><summary>Sheet evidence</summary>'
         '<dl class="mini-dl">'
         f"{_metrics_evidence('Sent', comparison.sent_metrics)}"
         f"{_metrics_evidence('Received', comparison.received_metrics)}"
-        f"</dl>{notes}</details>"
+        f"</dl>{_kpi_comparison_html(comparison)}{notes}</details>"
     )
 
 
@@ -887,6 +1379,98 @@ def _sheet_name_html(comparison: SheetComparison) -> str:
     )
 
 
+def _country_sheet_names(country: CountryResult, side: str) -> list[str]:
+    attribute = "sent_sheet_names" if side == "sent" else "received_sheet_names"
+    names = list(getattr(country, attribute, []) or [])
+    if names:
+        return names
+    indexed: list[tuple[int, str]] = []
+    for comparison in country.sheets:
+        index = comparison.sent_index if side == "sent" else comparison.received_index
+        name = comparison.sent_name if side == "sent" else comparison.received_name
+        if index is not None and name is not None:
+            indexed.append((index, name))
+    return [name for _, name in sorted(indexed)]
+
+
+def _inventory_list_html(
+    names: list[str],
+    other_names: list[str],
+    side: str,
+    reference_counts: Mapping[str, int],
+) -> str:
+    if not names:
+        return '<p class="muted">No sheet names available.</p>'
+    other_positions = {name: index for index, name in enumerate(other_names, start=1)}
+    items: list[str] = []
+    for index, name in enumerate(names, start=1):
+        if name not in other_positions:
+            state = _badge("Deleted" if side == "sent" else "Added", "error", "!")
+        elif other_positions[name] != index:
+            state = _badge(f"Position {other_positions[name]}", "info")
+        else:
+            state = ""
+        ref_count = reference_counts.get(name)
+        ref_text = (
+            f'<div class="cell-meta">#REF! {side.title()} {ref_count:,}</div>'
+            if ref_count is not None
+            else '<div class="cell-meta">#REF! count unavailable</div>'
+        )
+        items.append(
+            f'<li><span class="inventory-name">{_e(name)}</span>{state}{ref_text}</li>'
+        )
+    return f'<ol class="inventory-list">{"".join(items)}</ol>'
+
+
+def _sheet_inventory_html(country: CountryResult) -> str:
+    sent_names = _country_sheet_names(country, "sent")
+    received_names = _country_sheet_names(country, "received")
+    names_match = set(sent_names) == set(received_names)
+    order_matches = sent_names == received_names
+    sent_ref_counts: dict[str, int] = {}
+    received_ref_counts: dict[str, int] = {}
+    for comparison in country.sheets:
+        if comparison.sent_name is not None and comparison.sent_metrics is not None:
+            sent_ref_counts[comparison.sent_name] = int(
+                getattr(
+                    comparison.sent_metrics,
+                    "ref_error_count",
+                    getattr(comparison.sent_metrics, "ref_error_cells", 0),
+                )
+            )
+        if comparison.received_name is not None and comparison.received_metrics is not None:
+            received_ref_counts[comparison.received_name] = int(
+                getattr(
+                    comparison.received_metrics,
+                    "ref_error_count",
+                    getattr(comparison.received_metrics, "ref_error_cells", 0),
+                )
+            )
+    if names_match and order_matches:
+        status_label = "Names and order match"
+        status_badge = _status_badge("OK")
+    elif names_match:
+        status_label = "Names match; order differs"
+        status_badge = _badge("ORDER DIFFERS", "warn", "!")
+    else:
+        status_label = "Sheet names differ"
+        status_badge = _badge("NAMES DIFFER", "error", "!")
+    open_attr = "" if order_matches else " open"
+    return f"""
+<section id="sheet-inventory-section" class="section" aria-labelledby="sheet-inventory-heading">
+  <div class="section__heading"><h2 id="sheet-inventory-heading">Sheet inventory</h2></div>
+  <p class="section-intro">Exact, case-sensitive Excel sheet names are listed in workbook order. Counts alone do not determine whether the inventories match.</p>
+  <details id="sheet-inventory" class="card sheet-inventory"{open_attr}>
+    <summary><span class="sheet-inventory__summary"><span>{_e(status_label)} · {len(sent_names):,} sent → {len(received_names):,} received</span>{status_badge}</span></summary>
+    <div class="sheet-inventory__body inventory-grid">
+      <div class="inventory-panel"><h3>Sent workbook ({len(sent_names):,})</h3>{_inventory_list_html(sent_names, received_names, 'sent', sent_ref_counts)}</div>
+      <div class="inventory-panel"><h3>Received workbook ({len(received_names):,})</h3>{_inventory_list_html(received_names, sent_names, 'received', received_ref_counts)}</div>
+    </div>
+  </details>
+</section>
+"""
+
+
 def _sheet_table_html(country: CountryResult, finding_anchors: Mapping[str, str]) -> str:
     if not country.sheets:
         return (
@@ -906,24 +1490,26 @@ def _sheet_table_html(country: CountryResult, finding_anchors: Mapping[str, str]
             else ""
         )
         rows.append(
-            f'<tr id="sheet-{index}">'
+            f'<tr id="sheet-{index}" class="sheet-summary-row">'
             f"<td>{_status_badge(comparison.status)}{finding_links}</td>"
             f"<th scope=\"row\">{_sheet_name_html(comparison)}</th>"
             f"<td>{_metric_html(comparison.sent_metrics)}</td>"
             f"<td>{_metric_html(comparison.received_metrics)}</td>"
             f"<td>{_extent_delta(comparison)}</td>"
-            f"<td>{_axis_operations_html(comparison.row_operations, 'rows', comparison.status)}</td>"
-            f"<td>{_axis_operations_html(comparison.column_operations, 'columns', comparison.status)}</td>"
-            f"<td>{_sheet_evidence_html(comparison)}</td>"
+            f"<td>{_axis_operations_html(comparison.row_operations, 'ROW', comparison.status)}</td>"
+            f"<td>{_axis_operations_html(comparison.column_operations, 'COLUMN', comparison.status)}</td>"
+            f'<td class="reference-errors">{_reference_errors_html(comparison)}</td>'
             "</tr>"
+            '<tr class="sheet-evidence-row"><td colspan="8">'
+            f"{_sheet_evidence_html(comparison)}</td></tr>"
         )
     return (
         '<div class="table-wrap" tabindex="0" role="region" aria-label="Sheet comparison matrix">'
-        '<table class="sheet-table"><caption>Active extent deltas are evidence, while detected operations determine anomaly status.</caption>'
+        '<table class="sheet-table"><caption>Active extents, #REF! counts, and inferred operations are shown per sheet; expanded evidence uses the full table width.</caption>'
         "<thead><tr><th scope=\"col\">Status</th><th scope=\"col\">Sheet</th>"
         "<th scope=\"col\">Sent active extent</th><th scope=\"col\">Received active extent</th>"
         "<th scope=\"col\">Extent delta</th><th scope=\"col\">Row operations</th>"
-        "<th scope=\"col\">Column operations</th><th scope=\"col\">Evidence</th></tr></thead>"
+        "<th scope=\"col\">Column operations</th><th scope=\"col\">#REF! cells</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table></div>"
     )
 
@@ -932,22 +1518,42 @@ def _country_kpis(country: CountryResult) -> str:
     metrics = country.metrics
     comparable = country.comparison_state == "PAIRED"
     high_count = sum(finding.severity.upper() == "HIGH" for finding in country.findings)
+    medium_count = sum(finding.severity.upper() == "MEDIUM" for finding in country.findings)
     if comparable:
         sheets = f"{metrics.sent_sheet_count:,} → {metrics.received_sheet_count:,}"
         sheet_help = _operation_summary(metrics.sheets_added, metrics.sheets_deleted)
+        sheet_help += (
+            "; names match exactly"
+            if getattr(metrics, "sheet_names_match", True)
+            else "; names differ"
+        )
         rows = f"+{metrics.rows_added:,} / −{metrics.rows_deleted:,}"
         row_help = f"Net {_signed(metrics.row_net_delta)}"
         columns = f"+{metrics.columns_added:,} / −{metrics.columns_deleted:,}"
         column_help = f"Net {_signed(metrics.column_net_delta)}"
+        sent_refs = int(getattr(metrics, "sent_ref_errors", 0))
+        received_refs = int(getattr(metrics, "received_ref_errors", 0))
+        refs = f"{sent_refs:,} → {received_refs:,}"
+        ref_help = f"Delta {_signed(received_refs - sent_refs)}"
+        sent_kpis = int(getattr(metrics, "kpi_sent_count", 0))
+        received_kpis = int(getattr(metrics, "kpi_received_count", 0))
+        kpis = f"{sent_kpis:,} → {received_kpis:,}"
+        kpi_help = (
+            f"{int(getattr(metrics, 'kpi_missing_count', 0)):,} missing / "
+            f"{int(getattr(metrics, 'kpi_unexpected_count', 0)):,} unexpected"
+        )
     else:
-        sheets = rows = columns = "—"
-        sheet_help = row_help = column_help = "Not compared"
+        sheets = rows = columns = refs = kpis = "—"
+        sheet_help = row_help = column_help = ref_help = kpi_help = "Not compared"
     return (
         _kpi("Result", country.overall_status, country.comparison_state.replace("_", " "), "error" if country.overall_status.upper() == "ERROR" else "ok")
-        + _kpi("HIGH findings", _number(high_count), "Structural findings", "error" if high_count else "")
+        + _kpi("HIGH findings", _number(high_count), "Immediate action", "error" if high_count else "")
+        + _kpi("MEDIUM findings", _number(medium_count), "Review recommended", "warn" if medium_count else "")
         + _kpi("Sheets", sheets, sheet_help, "accent")
         + _kpi("Rows + / −", rows, row_help, "error" if metrics.rows_added or metrics.rows_deleted else "")
         + _kpi("Columns + / −", columns, column_help, "error" if metrics.columns_added or metrics.columns_deleted else "")
+        + _kpi("#REF! cells", refs, ref_help, "error" if comparable and int(getattr(metrics, "received_ref_errors", 0)) else "")
+        + _kpi("KPI identifiers", kpis, kpi_help, "error" if comparable and (int(getattr(metrics, "kpi_missing_count", 0)) or int(getattr(metrics, "kpi_unexpected_count", 0))) else "")
         + _kpi("Affected sheets", _number(metrics.affected_sheet_count), "With one or more findings", "error" if metrics.affected_sheet_count else "")
     )
 
@@ -959,10 +1565,6 @@ def _render_country_report(
     previous_filename: str | None,
     next_filename: str | None,
 ) -> str:
-    structural = [
-        finding for finding in country.findings if finding.category.upper() == "STRUCTURAL"
-    ]
-    other = [finding for finding in country.findings if finding.category.upper() != "STRUCTURAL"]
     anchors_by_object = {
         id(finding): f"finding-{index}" for index, finding in enumerate(country.findings, start=1)
     }
@@ -974,7 +1576,20 @@ def _render_country_report(
     else:
         empty_message = "Structural checks were not completed because a comparable workbook pair was unavailable."
     error_notices = _notice("Comparison errors", country.errors, "error")
-    warning_notices = _notice("Analysis notes", country.warnings, "warn")
+    warning_notices = _collapsible_notice("Analysis notes", country.warnings, "warn")
+    warning_section = (
+        '<section id="analysis-notes" class="section" aria-labelledby="analysis-notes-heading">'
+        '<div class="section__heading"><h2 id="analysis-notes-heading">Analysis notes</h2></div>'
+        f"{warning_notices}</section>"
+        if warning_notices
+        else ""
+    )
+    anomaly_filters = _anomaly_filters_html(country.findings)
+    anomaly_groups = _finding_groups_html(
+        country.findings,
+        anchors_by_object,
+        empty_message,
+    )
     previous_link = (
         f'<a class="button-link" href="{_e(previous_filename)}" rel="prev">Previous country</a>'
         if previous_filename
@@ -985,14 +1600,6 @@ def _render_country_report(
         if next_filename
         else ""
     )
-    other_html = ""
-    if other:
-        other_html = f"""
-  <section class="section" aria-labelledby="other-heading">
-    <div class="section__heading"><h2 id="other-heading">Other findings</h2></div>
-    {_finding_groups_html(other, anchors_by_object, 'No other findings.')}
-  </section>
-"""
     body = f"""
 <header class="topbar">
   <div class="topbar__inner">
@@ -1007,9 +1614,9 @@ def _render_country_report(
   </nav>
   <div class="hero">
     <div>
-      <p class="eyebrow">Country structural report</p>
+      <p class="eyebrow">Country anomaly report</p>
       <h1>{_e(country.display_name)}</h1>
-      <p class="lede">{_e(country.sent_file.name if country.sent_file else 'No sent workbook')} → {_e(country.received_file.name if country.received_file else 'No received workbook')}. This report covers sheet presence and inserted or deleted rows and columns only.</p>
+      <p class="lede">{_e(country.sent_file.name if country.sent_file else 'No sent workbook')} → {_e(country.received_file.name if country.received_file else 'No received workbook')}. This report covers workbook structure, KPI identifier integrity, and #REF! reference-error evidence.</p>
     </div>
     <div class="hero__status" aria-label="Country result">
       {_status_badge(country.overall_status)}
@@ -1017,20 +1624,19 @@ def _render_country_report(
       {_severity_badge(country.max_anomaly_severity)}
     </div>
   </div>
-  {error_notices}{warning_notices}
+  {error_notices}
   <section class="section" aria-labelledby="summary-heading">
     <div class="section__heading"><h2 id="summary-heading">Summary</h2><a href="{_e(Path(report_filename).with_suffix('.json').name)}">Download country JSON</a></div>
     <div class="grid kpi-grid">{_country_kpis(country)}</div>
   </section>
-  <section class="section" aria-labelledby="structural-heading">
-    <div class="section__heading"><h2 id="structural-heading">Structural anomalies</h2>{_severity_badge('HIGH')}</div>
-    <p class="section-intro">Findings are grouped by sheet. Added and deleted operations are shown independently, even when their net effect on dimensions is zero.</p>
-    {_finding_groups_html(structural, anchors_by_object, empty_message)}
-  </section>
-  {other_html}
+  {_sheet_inventory_html(country)}
+  <div id="anomaly-results" aria-label="Anomaly findings">
+    {anomaly_filters}
+    {anomaly_groups}
+  </div>
   <section class="section" aria-labelledby="sheets-heading">
     <div class="section__heading"><h2 id="sheets-heading">Sheet comparison</h2></div>
-    <p class="section-intro">Active extents summarize stored worksheet evidence. The operation columns show the alignment result used for structural anomaly detection.</p>
+    <p class="section-intro">Active extents, inferred row and column operations, KPI evidence, and #REF! cell counts are shown for every available sheet comparison.</p>
     {_sheet_table_html(country, anchors_by_id)}
   </section>
   <section class="section" aria-labelledby="sources-heading">
@@ -1045,7 +1651,9 @@ def _render_country_report(
         <li>Active extents are reconstructed from OOXML structural evidence; Excel's declared dimension is displayed as evidence but is not trusted as the sole source.</li>
         <li>Row and column operations are inferred through structural sequence alignment. Confidence and supporting evidence are shown for auditability; an unresolved alignment is itself a HIGH finding.</li>
         <li>Extent deltas are informational. Structural status uses detected operations, so an addition and deletion can be reported even when the final row or column count is unchanged.</li>
-        <li>Formula correctness, changed values, formatting intent, and business-rule validation are outside this report's current scope.</li>
+        <li>Only the sheet named KPI is evaluated for KPI identifiers. The detector resolves the column headed KPI and compares normalized identifiers, duplicates, and order.</li>
+        <li>#REF! totals count unique cells; cached error values and formula-text references are shown separately because one cell can provide both forms of evidence.</li>
+        <li>Other formula correctness, changed values, formatting intent, and broader business-rule validation are outside this report's current scope.</li>
       </ul>
     </div>
   </section>
@@ -1059,11 +1667,16 @@ def _render_country_report(
       <dt>Report schema</dt><dd>{_e(run.schema_version)}</dd>
     </dl></div>
   </section>
+  {warning_section}
   <p class="print-only">Country {_e(country.display_name)} · run {_e(run.run_id)} · generated {_e(run.generated_at_utc)}</p>
 </main>
-<footer class="footer"><div class="footer__inner">POPS structural anomaly detector · <a href="../index.html">Global report</a> · Run <code>{_e(run.run_id)}</code></div></footer>
+<footer class="footer"><div class="footer__inner">POPS anomaly detector · <a href="../index.html">Global report</a> · Run <code>{_e(run.run_id)}</code></div></footer>
 """
-    return _document(f"{country.display_name} — POPS structural report", body, _PRINT_DETAILS_JS)
+    return _document(
+        f"{country.display_name} — POPS anomaly report",
+        body,
+        _ANOMALY_FILTER_JS + _PRINT_DETAILS_JS,
+    )
 
 
 def render_country_report(run: RunResult, country: CountryResult) -> str:
