@@ -250,10 +250,18 @@ class ExpandedReportTests(unittest.TestCase):
         actual_counts = {
             item["code"]: item["finding_count"] for item in category_results
         }
-        self.assertEqual(actual_counts, expected_counts)
-        self.assertEqual(
-            set(actual_counts),
-            {"STRUCTURAL", "KPI_INTEGRITY", "FORMULA_INTEGRITY"},
+        for category, expected in expected_counts.items():
+            self.assertEqual(actual_counts.get(category), expected)
+        self.assertTrue(
+            all(
+                category in expected_counts or count == 0
+                for category, count in actual_counts.items()
+            )
+        )
+        self.assertTrue(
+            {"STRUCTURAL", "KPI_INTEGRITY", "FORMULA_INTEGRITY"}.issubset(
+                actual_counts
+            )
         )
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -267,7 +275,14 @@ class ExpandedReportTests(unittest.TestCase):
             item["code"]: item["finding_count"]
             for item in serialized["category_results"]
         }
-        self.assertEqual(written_counts, expected_counts)
+        for category, expected in expected_counts.items():
+            self.assertEqual(written_counts.get(category), expected)
+        self.assertTrue(
+            all(
+                category in expected_counts or count == 0
+                for category, count in written_counts.items()
+            )
+        )
 
 
 if __name__ == "__main__":

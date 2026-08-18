@@ -32,7 +32,7 @@ from .coordinates import (
     parse_cell_reference,
     parse_range_reference,
 )
-from .models import KpiColumnSnapshot, KpiEntry, SheetMetrics
+from .models import CellSnapshot, KpiColumnSnapshot, KpiEntry, SheetMetrics
 
 
 class WorkbookReadError(RuntimeError):
@@ -59,6 +59,8 @@ class SheetStructure:
     rows: list[AxisSignature]
     columns: list[AxisSignature]
     cell_anchors: dict[str, list[tuple[int, int]]]
+    material_cells: list[CellSnapshot]
+    generated_output_ranges: list[CellRange]
     kpi_snapshot: KpiColumnSnapshot
     ref_error_coordinates: list[str] = field(default_factory=list)
     cached_ref_error_coordinates: list[str] = field(default_factory=list)
@@ -90,6 +92,111 @@ class _SemanticCell:
     confidence: str
     literal_text: bool = False
 
+
+@dataclass(slots=True)
+class _SharedFormulaGroup:
+    cell_indices: list[int] = field(default_factory=list)
+    master_indices: list[int] = field(default_factory=list)
+
+
+def _merged_intervals(
+    intervals: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    merged: list[list[int]] = []
+    for start, end in sorted(intervals):
+        if not merged or start > merged[-1][1] + 1:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return tuple((start, end) for start, end in merged)
+
+
+def _interval_contains(intervals: tuple[tuple[int, int], ...], value: int) -> bool:
+    low = 0
+    high = len(intervals)
+    while low < high:
+        middle = (low + high) // 2
+        if intervals[middle][0] <= value:
+            low = middle + 1
+        else:
+            high = middle
+    return low > 0 and intervals[low - 1][1] >= value
+
+
+@dataclass(slots=True)
+class _GeneratedOutputIndex:
+    """Fast point queries for generated rectangles in Excel's fixed grid."""
+
+    row_intervals_by_column_node: dict[int, tuple[tuple[int, int], ...]]
+
+    @classmethod
+    def build(cls, ranges: list[CellRange]) -> _GeneratedOutputIndex:
+        buckets: dict[int, list[tuple[int, int]]] = defaultdict(list)
+
+        def register(
+            node: int,
+            left: int,
+            right: int,
+            query_left: int,
+            query_right: int,
+            row_interval: tuple[int, int],
+        ) -> None:
+            if query_left <= left and right <= query_right:
+                buckets[node].append(row_interval)
+                return
+            middle = (left + right) // 2
+            if query_left <= middle:
+                register(
+                    node * 2,
+                    left,
+                    middle,
+                    query_left,
+                    query_right,
+                    row_interval,
+                )
+            if query_right > middle:
+                register(
+                    node * 2 + 1,
+                    middle + 1,
+                    right,
+                    query_left,
+                    query_right,
+                    row_interval,
+                )
+
+        for bounds in ranges:
+            register(
+                1,
+                1,
+                MAX_EXCEL_COLUMN,
+                bounds.min_col,
+                bounds.max_col,
+                (bounds.min_row, bounds.max_row),
+            )
+        return cls(
+            row_intervals_by_column_node={
+                node: _merged_intervals(intervals)
+                for node, intervals in buckets.items()
+            }
+        )
+
+    def contains(self, row: int, col: int) -> bool:
+        node = 1
+        left = 1
+        right = MAX_EXCEL_COLUMN
+        while True:
+            intervals = self.row_intervals_by_column_node.get(node, ())
+            if _interval_contains(intervals, row):
+                return True
+            if left == right:
+                return False
+            middle = (left + right) // 2
+            if col <= middle:
+                node = node * 2
+                right = middle
+            else:
+                node = node * 2 + 1
+                left = middle + 1
 
 @dataclass(slots=True)
 class _SheetAccumulator:
@@ -127,7 +234,13 @@ class _SheetAccumulator:
     declared_dimension: str | None = None
     capture_kpi: bool = False
     kpi_semantic_cell_limit: int = 0
-    kpi_semantic_cells: list[_SemanticCell] = field(default_factory=list)
+    material_cell_limit: int = 0
+    material_cells: list[CellSnapshot] = field(default_factory=list)
+    kpi_semantic_cells: list[CellSnapshot] = field(default_factory=list)
+    generated_output_ranges: list[CellRange] = field(default_factory=list)
+    generated_output_range_set: set[CellRange] = field(default_factory=set)
+    generated_output_index: _GeneratedOutputIndex | None = None
+    shared_formula_groups: dict[str, _SharedFormulaGroup] = field(default_factory=dict)
     ref_error_count: int = 0
     cached_ref_error_count: int = 0
     formula_ref_error_count: int = 0
@@ -498,6 +611,137 @@ def _resolve_part(source_part: str, target: str) -> str:
     return posixpath.normpath(posixpath.join(posixpath.dirname(source_part), target))
 
 
+def _worksheet_object_relationship_ids(
+    archive: zipfile.ZipFile,
+    part_name: str,
+    sheet_name: str,
+    acc: _SheetAccumulator,
+) -> tuple[list[str], list[str]]:
+    """Pre-read relationship ids and declared calculated-output ranges.
+
+    Output ranges must be known before cells are tokenized. A bounded SAX
+    pre-pass avoids trusting orphaned relationships while keeping the worksheet
+    itself out of memory.
+    """
+
+    table_ids: list[str] = []
+    pivot_ids: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    current_row = 0
+    next_row = 1
+    next_column = 1
+    in_row = False
+    current_cell: tuple[int, int] | None = None
+    stream: BinaryIO | None = None
+    try:
+        stream = archive.open(part_name)
+        for event, element in ET.iterparse(stream, events=("start", "end")):
+            if event == "start":
+                tag = _local_name(element.tag)
+                if tag == "row":
+                    raw_row = _attribute(element, "r")
+                    try:
+                        current_row = int(raw_row) if raw_row else next_row
+                    except ValueError as exc:
+                        raise WorkbookReadError(
+                            f"Worksheet {sheet_name!r} contains an invalid row index."
+                        ) from exc
+                    if not 1 <= current_row <= MAX_EXCEL_ROW:
+                        raise WorkbookReadError(
+                            f"Worksheet {sheet_name!r} contains out-of-range row {current_row}."
+                        )
+                    in_row = True
+                    next_row = current_row + 1
+                    next_column = 1
+                    current_cell = None
+                elif tag == "c":
+                    if not in_row:
+                        raise WorkbookReadError(
+                            f"Worksheet {sheet_name!r} contains a cell outside a row element."
+                        )
+                    reference = _attribute(element, "r")
+                    if reference:
+                        try:
+                            row, col = parse_cell_reference(reference)
+                        except ValueError as exc:
+                            raise WorkbookReadError(
+                                f"Worksheet {sheet_name!r} contains invalid cell reference "
+                                f"{reference!r}."
+                            ) from exc
+                    else:
+                        row, col = current_row, next_column
+                    if row != current_row:
+                        raise WorkbookReadError(
+                            f"Cell {reference!r} is inconsistent with enclosing row "
+                            f"{current_row} in worksheet {sheet_name!r}."
+                        )
+                    current_cell = (row, col)
+                    next_column = col + 1
+                elif tag == "f":
+                    formula_type = (
+                        _attribute(element, "t") or "normal"
+                    ).strip().casefold()
+                    if formula_type in {"array", "datatable"}:
+                        formula_range = _attribute(element, "ref")
+                        if current_cell is None or not formula_range:
+                            acc.warnings.append(
+                                f"Ignored {formula_type} output mask without a bounded "
+                                f"anchor/range in worksheet {sheet_name!r}."
+                            )
+                            continue
+                        try:
+                            bounds = parse_range_reference(formula_range)
+                        except ValueError:
+                            acc.warnings.append(
+                                f"Ignored invalid {formula_type} output range "
+                                f"{formula_range!r} in worksheet {sheet_name!r}."
+                            )
+                            continue
+                        row, col = current_cell
+                        if not (
+                            bounds.min_row <= row <= bounds.max_row
+                            and bounds.min_col <= col <= bounds.max_col
+                        ):
+                            acc.warnings.append(
+                                f"Ignored {formula_type} output range {formula_range!r}: "
+                                f"anchor {index_to_column(col)}{row} lies outside it."
+                            )
+                            continue
+                        _add_generated_output_range(acc, bounds)
+                elif tag in {"tablePart", "pivotTablePart"}:
+                    relation_id = _attribute(element, "id")
+                    if not relation_id:
+                        raise WorkbookReadError(
+                            f"Worksheet {sheet_name!r} contains a {tag} without a relationship id."
+                        )
+                    key = (tag, relation_id)
+                    if key in seen:
+                        raise WorkbookReadError(
+                            f"Worksheet {sheet_name!r} repeats {tag} relationship {relation_id!r}."
+                        )
+                    seen.add(key)
+                    (table_ids if tag == "tablePart" else pivot_ids).append(
+                        relation_id
+                    )
+            elif _local_name(element.tag) == "c":
+                current_cell = None
+                element.clear()
+            elif _local_name(element.tag) == "row":
+                in_row = False
+                current_cell = None
+                element.clear()
+            else:
+                element.clear()
+    except ET.ParseError as exc:
+        raise WorkbookReadError(
+            f"Invalid worksheet XML for {sheet_name!r}: {exc}"
+        ) from exc
+    finally:
+        if stream is not None:
+            stream.close()
+    return table_ids, pivot_ids
+
+
 def _office_document_part(archive: zipfile.ZipFile) -> str:
     for _rel_id, (target, rel_type) in _relationships(archive, "_rels/.rels").items():
         if rel_type.rstrip("/").endswith("/officeDocument"):
@@ -544,7 +788,6 @@ def _register_range(
     strong: bool = False,
     affects_extent: bool = True,
 ) -> None:
-    acc.stored_cell_count += 1
     try:
         bounds = parse_range_reference(reference)
     except ValueError:
@@ -557,6 +800,50 @@ def _register_range(
         acc.active_max_row = max(acc.active_max_row, bounds.max_row)
     if affects_extent and bounds.max_col < MAX_EXCEL_COLUMN:
         acc.active_max_column = max(acc.active_max_column, bounds.max_col)
+
+
+def _add_generated_output_range(
+    acc: _SheetAccumulator,
+    bounds: CellRange,
+) -> None:
+    if bounds not in acc.generated_output_range_set:
+        acc.generated_output_range_set.add(bounds)
+        acc.generated_output_ranges.append(bounds)
+
+
+def _inside_generated_output(
+    acc: _SheetAccumulator,
+    row: int,
+    col: int,
+) -> bool:
+    return (
+        acc.generated_output_index is not None
+        and acc.generated_output_index.contains(row, col)
+    )
+
+
+def _unsigned_attribute(
+    element: ET.Element,
+    name: str,
+    *,
+    default: int,
+    maximum: int,
+    context: str,
+) -> int:
+    raw = _attribute(element, name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise WorkbookReadError(
+            f"{context} has invalid {name}={raw!r}."
+        ) from exc
+    if not 0 <= value <= maximum:
+        raise WorkbookReadError(
+            f"{context} has out-of-range {name}={raw!r}."
+        )
+    return value
 
 
 def _property_token(
@@ -778,16 +1065,27 @@ def _record_ref_errors(
 
 def _capture_kpi_semantic_cell(
     acc: _SheetAccumulator,
-    semantic: _SemanticCell | None,
+    snapshot: CellSnapshot,
 ) -> None:
-    if not acc.capture_kpi or semantic is None:
+    if not acc.capture_kpi:
         return
     if len(acc.kpi_semantic_cells) >= acc.kpi_semantic_cell_limit:
         raise WorkbookReadError(
             "The KPI worksheet exceeds the configured "
             f"{acc.kpi_semantic_cell_limit:,}-semantic-cell limit."
         )
-    acc.kpi_semantic_cells.append(semantic)
+    acc.kpi_semantic_cells.append(snapshot)
+
+
+def _capture_material_cell(acc: _SheetAccumulator, snapshot: CellSnapshot) -> int:
+    if len(acc.material_cells) >= acc.material_cell_limit:
+        raise WorkbookReadError(
+            "Worksheet comparison evidence exceeds the configured "
+            f"{acc.material_cell_limit:,}-material-cell limit."
+        )
+    acc.material_cells.append(snapshot)
+    _capture_kpi_semantic_cell(acc, snapshot)
+    return len(acc.material_cells) - 1
 
 
 def _kpi_snapshot(acc: _SheetAccumulator, header_scan_rows: int) -> KpiColumnSnapshot:
@@ -799,13 +1097,15 @@ def _kpi_snapshot(acc: _SheetAccumulator, header_scan_rows: int) -> KpiColumnSna
             item
             for item in acc.kpi_semantic_cells
             if item.row <= header_scan_rows
-            and item.literal_text
+            and not item.has_formula
+            and item.value_kind == "TEXT"
+            and item.display_value is not None
             and _normalize_text(item.display_value) == "kpi"
         ),
         key=lambda item: (item.row, item.col),
     )
     candidate_coordinates = [
-        f"{index_to_column(item.col)}{item.row}" for item in candidates
+        item.coordinate for item in candidates
     ]
     scan_note = f"Literal KPI headers were searched in the first {header_scan_rows:,} rows."
     if not candidates:
@@ -838,12 +1138,13 @@ def _kpi_snapshot(acc: _SheetAccumulator, header_scan_rows: int) -> KpiColumnSna
         KpiEntry(
             display_value=item.display_value,
             comparison_key=item.comparison_key,
-            coordinate=f"{index_to_column(item.col)}{item.row}",
+            coordinate=item.coordinate,
             row=item.row,
             value_kind=item.value_kind,
             confidence=item.confidence,
         )
         for item in body
+        if item.display_value is not None
     ]
     coordinates_by_key: dict[str, list[str]] = defaultdict(list)
     for entry in entries:
@@ -861,7 +1162,10 @@ def _kpi_snapshot(acc: _SheetAccumulator, header_scan_rows: int) -> KpiColumnSna
         )
     else:
         notes.append(f"No nonblank semantic cells were found below {header_coordinate}.")
-    formula_cache_count = sum(item.value_kind.startswith("FORMULA_") for item in entries)
+    formula_cache_count = sum(
+        item.value_kind.startswith("FORMULA_") and item.confidence == "MEDIUM"
+        for item in entries
+    )
     unresolved_count = sum(item.comparison_key is None for item in entries)
     if formula_cache_count:
         notes.append(
@@ -890,6 +1194,7 @@ def _parse_cell(
     shared_formulas: dict[str, tuple[str, str]],
     acc: _SheetAccumulator,
 ) -> None:
+    acc.stored_cell_count += 1
     cell_type = _attribute(cell, "t") or "n"
     style_index_raw = _attribute(cell, "s") or "0"
     try:
@@ -917,20 +1222,18 @@ def _parse_cell(
         cached_error=cached_ref_error,
         formula_error=formula_ref_error,
     )
-    if acc.capture_kpi:
-        _capture_kpi_semantic_cell(
-            acc,
-            _semantic_cell(
-                row=row,
-                col=col,
-                cell_type=cell_type,
-                has_formula=has_formula,
-                cache_present=value_element is not None or inline_element is not None,
-                raw_value=raw_value,
-                inline_value=inline_value,
-                shared_strings=shared_strings,
-            ),
-        )
+    cache_present = value_element is not None or inline_element is not None
+    semantic = _semantic_cell(
+        row=row,
+        col=col,
+        cell_type=cell_type,
+        has_formula=has_formula,
+        cache_present=cache_present,
+        raw_value=raw_value,
+        inline_value=inline_value,
+        shared_strings=shared_strings,
+    )
+    generated_output = _inside_generated_output(acc, row, col)
 
     has_content = has_formula or raw_value is not None or inline_value is not None
     # A default-style empty <c> is serialization noise, not a materialized
@@ -940,13 +1243,15 @@ def _parse_cell(
     acc.cell_count += int(has_content)
     acc.formula_count += int(has_formula)
     acc.styled_blank_count += int(not has_content and style_index != 0)
-    _mark_active(acc, row, col)
-    if has_content:
-        _mark_content(acc, row, col)
+    if not generated_output:
+        _mark_active(acc, row, col)
+        if has_content:
+            _mark_content(acc, row, col)
 
     style_token = f"S:{style}"
-    _add_weight(acc.row_weights, row, style_token, 1.0)
-    _add_weight(acc.column_weights, col, style_token, 1.0)
+    if not generated_output:
+        _add_weight(acc.row_weights, row, style_token, 1.0)
+        _add_weight(acc.column_weights, col, style_token, 1.0)
 
     kind = (
         "FORMULA"
@@ -957,14 +1262,70 @@ def _parse_cell(
         if has_content
         else "BLANK_STYLED"
     )
-    _add_weight(acc.row_weights, row, f"K:{kind}", 0.35)
-    _add_weight(acc.column_weights, col, f"K:{kind}", 0.35)
+    if not generated_output:
+        _add_weight(acc.row_weights, row, f"K:{kind}", 0.35)
+        _add_weight(acc.column_weights, col, f"K:{kind}", 0.35)
 
     if has_formula:
-        formula_type = _attribute(formula_element, "t") or "normal"
+        formula_type = (_attribute(formula_element, "t") or "normal").strip()
+        is_shared_formula = formula_type.casefold() == "shared"
         shared_index = _attribute(formula_element, "si")
+        formula_range = _attribute(formula_element, "ref")
+        explicit_formula = formula if formula is not None and formula.strip() else None
+        comparison_shape: str | None = None
+        comparison_relative: str | None = None
+        formula_status = "UNRESOLVED"
+        if explicit_formula is not None:
+            try:
+                comparison_shape, comparison_relative = _normalize_formula(
+                    explicit_formula, row, col
+                )
+                formula_status = "RESOLVED"
+            except ValueError:
+                # Invalid A1 coordinates must not become a guessed comparable
+                # representation. The raw formula remains available as evidence.
+                comparison_shape = None
+                comparison_relative = None
+
+        material = CellSnapshot(
+            coordinate=coordinate,
+            row=row,
+            col=col,
+            has_formula=True,
+            display_value=semantic.display_value if semantic is not None else None,
+            comparison_key=semantic.comparison_key if semantic is not None else None,
+            value_kind=(
+                semantic.value_kind
+                if semantic is not None
+                else "FORMULA_BLANK" if cache_present else "FORMULA_UNRESOLVED"
+            ),
+            confidence=(
+                semantic.confidence
+                if semantic is not None
+                else "MEDIUM" if cache_present else "LOW"
+            ),
+            formula_status=formula_status,
+            formula_type=formula_type,
+            formula_text=explicit_formula,
+            formula_shape=comparison_shape,
+            formula_relative=comparison_relative,
+            formula_group=shared_index,
+            formula_range=formula_range,
+        )
+        material_index = _capture_material_cell(acc, material)
+        if is_shared_formula and shared_index:
+            group = acc.shared_formula_groups.setdefault(
+                shared_index, _SharedFormulaGroup()
+            )
+            group.cell_indices.append(material_index)
+            if explicit_formula is not None:
+                group.master_indices.append(material_index)
+
+        # Structural signatures retain their established behavior. Formula
+        # identity for semantic comparison is kept separately above and never
+        # uses a cached result.
         cached_normalization = shared_formulas.get(shared_index or "")
-        if formula_type == "shared" and formula is None and cached_normalization is not None:
+        if is_shared_formula and formula is None and cached_normalization is not None:
             shape, relative = cached_normalization
         else:
             formula_text = formula or f"{formula_type.upper()}:{shared_index or '?'}"
@@ -973,8 +1334,13 @@ def _parse_cell(
             except ValueError:
                 shape = re.sub(r"\s+", "", formula_text).upper()
                 relative = shape
-            if formula_type == "shared" and shared_index and formula is not None:
+            if is_shared_formula and shared_index and formula is not None:
                 shared_formulas[shared_index] = (shape, relative)
+        if generated_output:
+            # Pivot/query/table-calculation contents are regenerated by Excel.
+            # Formula evidence remains available for direct integrity checks,
+            # while the expression/cache cannot become a structural anchor.
+            return
         shape_token = f"F:{_hash_payload(shape)}"
         relative_token = f"R:{_hash_payload(relative)}"
         for target, axis in ((acc.row_weights, row), (acc.column_weights, col)):
@@ -983,6 +1349,31 @@ def _parse_cell(
         acc.row_strong[row].add(relative_token)
         acc.column_strong[col].add(relative_token)
         acc.cell_anchors[relative_token].append((row, col))
+        return
+
+    if semantic is not None:
+        snapshot = CellSnapshot(
+            coordinate=coordinate,
+            row=row,
+            col=col,
+            has_formula=False,
+            display_value=semantic.display_value,
+            comparison_key=semantic.comparison_key,
+            value_kind=semantic.value_kind,
+            confidence=semantic.confidence,
+        )
+        if generated_output:
+            # Generated literals are not generic prefills or structure, but a
+            # KPI sheet still needs its dedicated semantic stream so an
+            # unchanged query-backed KPI table does not look headerless.
+            _capture_kpi_semantic_cell(acc, snapshot)
+        else:
+            _capture_material_cell(acc, snapshot)
+
+    if generated_output:
+        # The style, occupied coordinate, and explicit object range remain
+        # structural evidence. The generated scalar itself is not protected
+        # template content and does not identify a logical row or column.
         return
 
     text_value: str | None = None
@@ -1011,6 +1402,246 @@ def _parse_cell(
         _add_weight(acc.column_weights, col, token, 0.45)
 
 
+def _resolve_shared_formula_groups(acc: _SheetAccumulator) -> None:
+    """Resolve shared followers only from a unique, bounded OOXML master."""
+
+    missing_group = sum(
+        item.has_formula
+        and (item.formula_type or "").casefold() == "shared"
+        and not item.formula_group
+        and item.formula_text is None
+        for item in acc.material_cells
+    )
+    if missing_group:
+        acc.warnings.append(
+            f"{missing_group:,} shared-formula follower(s) have no shared group id and remain unresolved."
+        )
+
+    for group_id, group in sorted(acc.shared_formula_groups.items()):
+        master_indices = set(group.master_indices)
+        followers = [
+            index for index in group.cell_indices if index not in master_indices
+        ]
+        if not followers:
+            continue
+        if len(group.master_indices) != 1:
+            acc.warnings.append(
+                f"Shared formula group {group_id!r} has {len(group.master_indices)} explicit "
+                f"master cells; {len(followers):,} follower(s) remain unresolved."
+            )
+            continue
+
+        master = acc.material_cells[group.master_indices[0]]
+        if (
+            master.formula_status != "RESOLVED"
+            or master.formula_shape is None
+            or master.formula_relative is None
+            or not master.formula_range
+        ):
+            acc.warnings.append(
+                f"Shared formula group {group_id!r} has no fully resolved bounded master; "
+                f"{len(followers):,} follower(s) remain unresolved."
+            )
+            continue
+        try:
+            bounds = parse_range_reference(master.formula_range)
+        except ValueError:
+            acc.warnings.append(
+                f"Shared formula group {group_id!r} has invalid master range "
+                f"{master.formula_range!r}; {len(followers):,} follower(s) remain unresolved."
+            )
+            continue
+        if not (
+            bounds.min_row <= master.row <= bounds.max_row
+            and bounds.min_col <= master.col <= bounds.max_col
+        ):
+            acc.warnings.append(
+                f"Shared formula group {group_id!r} master {master.coordinate} lies outside "
+                f"its declared range {master.formula_range!r}; followers remain unresolved."
+            )
+            continue
+
+        unresolved = 0
+        for index in followers:
+            follower = acc.material_cells[index]
+            if not (
+                bounds.min_row <= follower.row <= bounds.max_row
+                and bounds.min_col <= follower.col <= bounds.max_col
+            ):
+                unresolved += 1
+                continue
+            # OOXML defines a shared follower as the master's formula translated
+            # to this cell. Its coordinate-relative representation is therefore
+            # the same as the master's. We intentionally do not fabricate an A1
+            # formula string; the validated normalized pattern is sufficient for
+            # identity comparison and the explicit text remains None.
+            follower.formula_shape = master.formula_shape
+            follower.formula_relative = master.formula_relative
+            follower.formula_status = "RESOLVED_SHARED"
+            follower.formula_range = master.formula_range
+        if unresolved:
+            acc.warnings.append(
+                f"Shared formula group {group_id!r} has {unresolved:,} follower(s) outside "
+                f"declared range {master.formula_range!r}; those followers remain unresolved."
+            )
+
+
+def _related_part(
+    archive: zipfile.ZipFile,
+    source_part: str,
+    relation_id: str,
+    relationships: dict[str, tuple[str, str]],
+    *,
+    expected_type: str,
+    label: str,
+) -> str:
+    relation = relationships.get(relation_id)
+    if not relation:
+        raise WorkbookReadError(f"Missing {label} relationship {relation_id!r}.")
+    relation_type = relation[1].rstrip("/").casefold()
+    if not relation_type.endswith(f"/{expected_type.casefold()}"):
+        raise WorkbookReadError(
+            f"{label.capitalize()} relationship {relation_id!r} has unexpected type "
+            f"{relation[1]!r}."
+        )
+    part = _resolve_part(source_part, relation[0])
+    if part not in archive.namelist():
+        raise WorkbookReadError(f"Missing {label} part {part!r}.")
+    return part
+
+
+def _required_part_range(
+    root: ET.Element,
+    *,
+    part: str,
+    label: str,
+) -> tuple[str, CellRange]:
+    reference = _attribute(root, "ref")
+    if not reference:
+        raise WorkbookReadError(f"{label.capitalize()} part {part!r} has no range reference.")
+    if "!" in reference:
+        raise WorkbookReadError(
+            f"{label.capitalize()} part {part!r} has non-local range {reference!r}."
+        )
+    try:
+        return reference, parse_range_reference(reference)
+    except ValueError as exc:
+        raise WorkbookReadError(
+            f"{label.capitalize()} part {part!r} has invalid range {reference!r}."
+        ) from exc
+
+
+def _table_has_query_source(
+    archive: zipfile.ZipFile,
+    table_part: str,
+    root: ET.Element,
+) -> bool:
+    relationships = _relationships(archive, _rels_part(table_part))
+    query_relations = [
+        (relation_id, relation)
+        for relation_id, relation in relationships.items()
+        if relation[1].rstrip("/").casefold().endswith("/querytable")
+    ]
+    for relation_id, _relation in query_relations:
+        query_part = _related_part(
+            archive,
+            table_part,
+            relation_id,
+            relationships,
+            expected_type="queryTable",
+            label="query-table",
+        )
+        try:
+            query_root = _xml_root(archive, query_part)
+        except ET.ParseError as exc:
+            raise WorkbookReadError(
+                f"Invalid query-table part {query_part!r}: {exc}."
+            ) from exc
+        if _local_name(query_root.tag) != "queryTable":
+            raise WorkbookReadError(
+                f"Query-table part {query_part!r} has unexpected root "
+                f"{_local_name(query_root.tag)!r}."
+            )
+    table_type = (_attribute(root, "tableType") or "").strip().casefold()
+    return bool(query_relations) or table_type == "querytable"
+
+
+def _register_table_generated_outputs(
+    acc: _SheetAccumulator,
+    root: ET.Element,
+    bounds: CellRange,
+    *,
+    part: str,
+    query_backed: bool,
+) -> None:
+    if query_backed:
+        _add_generated_output_range(acc, bounds)
+        return
+
+    width = bounds.max_col - bounds.min_col + 1
+    height = bounds.max_row - bounds.min_row + 1
+    header_rows = _unsigned_attribute(
+        root,
+        "headerRowCount",
+        default=1,
+        maximum=height,
+        context=f"Table part {part!r}",
+    )
+    totals_rows = _unsigned_attribute(
+        root,
+        "totalsRowCount",
+        default=0,
+        maximum=height,
+        context=f"Table part {part!r}",
+    )
+    if header_rows + totals_rows > height:
+        raise WorkbookReadError(
+            f"Table part {part!r} has header/totals rows outside its range."
+        )
+
+    columns_parent = next(
+        (child for child in root if _local_name(child.tag) == "tableColumns"),
+        None,
+    )
+    if columns_parent is None:
+        return
+    columns = [
+        child
+        for child in columns_parent
+        if _local_name(child.tag) == "tableColumn"
+    ]
+    if len(columns) != width:
+        raise WorkbookReadError(
+            f"Table part {part!r} declares {len(columns):,} column definition(s) "
+            f"for a {width:,}-column range."
+        )
+
+    body_min_row = bounds.min_row + header_rows
+    body_max_row = bounds.max_row - totals_rows
+    totals_min_row = bounds.max_row - totals_rows + 1
+    for offset, column in enumerate(columns):
+        col = bounds.min_col + offset
+        children = {_local_name(child.tag) for child in column}
+        if (
+            "calculatedColumnFormula" in children
+            and body_min_row <= body_max_row
+        ):
+            _add_generated_output_range(
+                acc,
+                CellRange(body_min_row, col, body_max_row, col),
+            )
+        totals_function = (
+            _attribute(column, "totalsRowFunction") or "none"
+        ).strip().casefold()
+        if totals_rows and (
+            "totalsRowFormula" in children or totals_function != "none"
+        ):
+            _add_generated_output_range(
+                acc,
+                CellRange(totals_min_row, col, bounds.max_row, col),
+            )
+
+
 def _read_table_ranges(
     archive: zipfile.ZipFile,
     sheet_part: str,
@@ -1019,20 +1650,86 @@ def _read_table_ranges(
     acc: _SheetAccumulator,
 ) -> None:
     for relation_id in relation_ids:
-        relation = relationships.get(relation_id)
-        if not relation:
-            raise WorkbookReadError(f"Missing table relationship {relation_id!r}.")
-        part = _resolve_part(sheet_part, relation[0])
-        if part not in archive.namelist():
-            raise WorkbookReadError(f"Missing table part {part!r}.")
+        part = _related_part(
+            archive,
+            sheet_part,
+            relation_id,
+            relationships,
+            expected_type="table",
+            label="table",
+        )
         try:
             root = _xml_root(archive, part)
         except ET.ParseError as exc:
             raise WorkbookReadError(f"Invalid table part {part!r}: {exc}.") from exc
-        reference = _attribute(root, "ref")
-        if reference:
+        if _local_name(root.tag) != "table":
+            raise WorkbookReadError(
+                f"Table part {part!r} has unexpected root {_local_name(root.tag)!r}."
+            )
+        reference, bounds = _required_part_range(
+            root,
+            part=part,
+            label="table",
+        )
+        query_backed = _table_has_query_source(archive, part, root)
+        # A query refresh can resize the table without a country inserting
+        # worksheet rows or columns. Its bounds and generated cells therefore
+        # must not become structural alignment anchors.
+        if not query_backed:
             _register_range(acc, reference, "TABLE", strong=True)
-            acc.table_count += 1
+        acc.table_count += 1
+        _register_table_generated_outputs(
+            acc,
+            root,
+            bounds,
+            part=part,
+            query_backed=query_backed,
+        )
+
+
+def _read_pivot_table_ranges(
+    archive: zipfile.ZipFile,
+    sheet_part: str,
+    relation_ids: list[str],
+    relationships: dict[str, tuple[str, str]],
+    acc: _SheetAccumulator,
+) -> None:
+    for relation_id in relation_ids:
+        part = _related_part(
+            archive,
+            sheet_part,
+            relation_id,
+            relationships,
+            expected_type="pivotTable",
+            label="PivotTable",
+        )
+        try:
+            root = _xml_root(archive, part)
+        except ET.ParseError as exc:
+            raise WorkbookReadError(
+                f"Invalid PivotTable part {part!r}: {exc}."
+            ) from exc
+        if _local_name(root.tag) != "pivotTableDefinition":
+            raise WorkbookReadError(
+                f"PivotTable part {part!r} has unexpected root "
+                f"{_local_name(root.tag)!r}."
+            )
+        locations = [
+            child for child in root if _local_name(child.tag) == "location"
+        ]
+        if len(locations) != 1:
+            raise WorkbookReadError(
+                f"PivotTable part {part!r} has {len(locations):,} location element(s)."
+            )
+        reference, bounds = _required_part_range(
+            locations[0],
+            part=part,
+            label="PivotTable location",
+        )
+        # PivotTable locations are regenerated and may expand or contract on
+        # refresh. Keep the range only as a generated-output mask, not as proof
+        # of a manual worksheet-axis operation.
+        _add_generated_output_range(acc, bounds)
 
 
 def _read_drawing_ranges(
@@ -1163,17 +1860,48 @@ def _parse_worksheet(
     acc = _SheetAccumulator(
         capture_kpi=_normalize_text(name) == "kpi",
         kpi_semantic_cell_limit=config.max_kpi_semantic_cells,
+        material_cell_limit=config.max_comparison_cells_per_sheet,
     )
     current_row = 0
     in_row = False
     next_row = 1
     next_column = 1
-    table_relation_ids: list[str] = []
     drawing_relation_ids: list[str] = []
     shared_formulas: dict[str, tuple[str, str]] = {}
     seen_rows: set[int] = set()
     seen_cells: set[tuple[int, int]] = set()
     relationships = _relationships(archive, _rels_part(part_name))
+    table_relation_ids, pivot_relation_ids = _worksheet_object_relationship_ids(
+        archive,
+        part_name,
+        name,
+        acc,
+    )
+    _read_table_ranges(
+        archive,
+        part_name,
+        table_relation_ids,
+        relationships,
+        acc,
+    )
+    _read_pivot_table_ranges(
+        archive,
+        part_name,
+        pivot_relation_ids,
+        relationships,
+        acc,
+    )
+    acc.generated_output_ranges.sort(
+        key=lambda bounds: (
+            bounds.min_row,
+            bounds.min_col,
+            bounds.max_row,
+            bounds.max_col,
+        )
+    )
+    acc.generated_output_index = _GeneratedOutputIndex.build(
+        acc.generated_output_ranges
+    )
 
     stream: BinaryIO | None = None
     try:
@@ -1273,10 +2001,6 @@ def _parse_worksheet(
                     reference = _attribute(element, "topLeftCell")
                     if reference:
                         _register_range(acc, reference, "FREEZE_PANE", affects_extent=False)
-                elif tag == "tablePart":
-                    relation_id = _attribute(element, "id")
-                    if relation_id:
-                        table_relation_ids.append(relation_id)
                 elif tag == "drawing":
                     relation_id = _attribute(element, "id")
                     if relation_id:
@@ -1332,7 +2056,8 @@ def _parse_worksheet(
         if stream is not None:
             stream.close()
 
-    _read_table_ranges(archive, part_name, table_relation_ids, relationships, acc)
+    _resolve_shared_formula_groups(acc)
+    acc.material_cells.sort(key=lambda item: (item.row, item.col))
     _read_drawing_ranges(archive, part_name, drawing_relation_ids, relationships, acc)
 
     if acc.active_max_row > config.max_active_rows:
@@ -1393,6 +2118,8 @@ def _parse_worksheet(
         rows=rows,
         columns=columns,
         cell_anchors=dict(acc.cell_anchors),
+        material_cells=acc.material_cells,
+        generated_output_ranges=list(acc.generated_output_ranges),
         kpi_snapshot=_kpi_snapshot(acc, config.kpi_header_scan_rows),
         ref_error_coordinates=list(acc.ref_error_coordinates),
         cached_ref_error_coordinates=list(acc.cached_ref_error_coordinates),
@@ -1418,6 +2145,8 @@ def _empty_nonworksheet(
         rows=[],
         columns=[],
         cell_anchors={},
+        material_cells=[],
+        generated_output_ranges=[],
         kpi_snapshot=KpiColumnSnapshot(
             status="NOT_APPLICABLE",
             notes=(

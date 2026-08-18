@@ -4,7 +4,7 @@ This project compares each POPS workbook sent to a country with the workbook
 received back under the same filename. It produces a self-contained HTML report
 for every country and a global dashboard.
 
-Version 0.2 checks three anomaly categories:
+Version 0.3 checks four anomaly categories:
 
 - **Structural anomalies — HIGH**
   - sheets added or deleted;
@@ -18,16 +18,21 @@ Version 0.2 checks three anomaly categories:
   - missing, ambiguous, or non-comparable KPI identifiers — **HIGH**;
   - order-only KPI changes when membership and duplicate counts still match —
     **MEDIUM**.
-- **Formula integrity anomalies — HIGH**
-  - an increase in stored or explicit `#REF!` cells. Counts for sent and
-    received are always shown per sheet, including their cached-error and
-    formula-token components.
+- **Formula integrity anomalies**
+  - an increase in formulas containing an explicit, unquoted `#REF!` token —
+    **HIGH**. Stored/cached `#REF!` cells are still counted and shown per sheet,
+    but a cache-only change does not create an anomaly because Excel may simply
+    have recalculated an unchanged formula;
+  - a sent formula removed, replaced by a hardcoded value, or fundamentally
+    modified — **MEDIUM**.
+- **Value integrity anomalies — MEDIUM**
+  - a meaningful prefilled literal from the sent template was changed or
+    removed. Blank cells, numeric/text zero (`0`, `0.0`, and equivalent zero
+    forms), and a lone `-` are treated as fillable placeholders and are exempt.
 
-Generic value changes, generic formula changes, formatting edits,
-hidden/unhidden rows, and changed row heights or column widths are deliberately
-not reported as anomalies yet. They are used only as supporting evidence for
-row and column alignment. KPI identifiers and explicit `#REF!` errors are the
-two intentional semantic exceptions in this version.
+Formatting edits, hidden/unhidden rows, and changed row heights or column
+widths are deliberately not reported as content anomalies. They remain useful
+supporting evidence for row and column alignment.
 
 ## Quick start
 
@@ -87,6 +92,8 @@ contain sensitive country data.
 --max-active-rows N          default: 100000
 --max-active-columns N       default: 16384
 --max-cells-per-sheet N      default: 5000000
+--max-comparison-cells-per-sheet N
+                              default: 500000
 --kpi-header-scan-rows N     default: 200
 --max-kpi-semantic-cells N   default: 250000
 --alignment-band N           default: 240
@@ -136,9 +143,11 @@ an input workbook. It:
    worksheet filenames;
 2. resolves shared and inline strings and ignores formula cache values;
 3. compares semantic style definitions rather than workbook-local style IDs;
-4. builds coordinate-independent fingerprints from labels, normalized formula
-   shapes, styles, cell types, row/column properties, merges, tables, filters,
-   validations, and drawing anchors;
+4. builds coordinate-independent fingerprints from stable labels, normalized
+   formula shapes, styles, cell types, row/column properties, merges, static
+   tables, filters, validations, and drawing anchors. Recalculated array/data
+   table outputs and refresh-driven PivotTable/query-table cells and ranges are
+   not used as structural anchors;
 5. aligns rows while ignoring column positions, then columns while ignoring row
    positions, using stable anchors and an affine-gap sequence alignment;
 6. preserves every contiguous insertion/deletion block, including combinations
@@ -153,11 +162,34 @@ an input workbook. It:
    normalized identifier sequences with duplicate multiplicity preserved;
 9. counts a cell once when it stores the Excel error `#REF!`, its formula
    contains an unquoted `#REF!` token, or both. Text values and quoted formula
-   text such as `IFERROR(A1,"#REF!")` are not counted.
+   text such as `IFERROR(A1,"#REF!")` are not counted. Only an increase in the
+   explicit formula-token component creates the HIGH anomaly; cached errors
+   remain audit metrics;
+10. compares sent formulas only after both worksheet axes have a validated
+    logical map. A1 references are translated into the sent workbook's logical
+    coordinates, including cross-sheet references, so Excel's automatic shifts
+    after a row or column insertion/deletion do not look like manual edits;
+11. reports formula-to-value replacement, formula removal, and changes to
+    functions, operators, constants, or safely mapped references. Formula
+    result caches are never used as formula identity;
+12. compares meaningful sent literals at the same validated logical cells,
+    using typed values so numeric `1` equals `1.0`, while deliberately allowing
+    countries to complete blank, zero, or `-` placeholders. Stored outputs
+    covered by array formulas, data tables, PivotTables, query-backed tables,
+    and table calculated columns/totals are excluded because Excel may refresh
+    or recalculate them automatically. Those recalculated/generated outputs
+    are likewise excluded from row/column inference, while their formula
+    anchors remain auditable.
 
 Every confirmed/inferred structural finding has severity `HIGH`. Confidence is
 reported separately as `HIGH`, `MEDIUM`, or `LOW` and reflects positional
 evidence, not business impact.
+
+Formula removals, hardcoded replacements, fundamental formula edits, and
+prefilled-value changes have severity `MEDIUM`. They are aggregated by type and
+sheet, with up to 40 representative A1 comparisons in the report. Cells on a
+deleted axis or a sheet whose topology cannot be mapped are counted as
+skipped/unresolved and never guessed at a physical coordinate.
 
 KPI values are type-aware: numeric `1` and `1.0` match, while text `"1"` is a
 different identifier. Literal values have high evidence confidence. A formula
@@ -178,6 +210,11 @@ Some histories are mathematically indistinguishable from the final `.xlsx`:
 - a local rectangular cell shift is not a whole-row or whole-column edit.
 - a read-only OOXML parser does not calculate formulas, follow external links,
   or discover errors that Excel would create only during recalculation;
+- unsupported formula syntax, references into an inserted/deleted axis, and
+  ambiguous local shifts are skipped rather than classified as manual edits;
+- validated shared-formula followers can prove changes to the expression shape
+  (for example an operator or constant), but uncertain reference-only changes
+  may be omitted to avoid false positives;
 - a formula whose `#REF!` text appears only through a shared-formula follower
   may require its stored error cache to be visible at that cell;
 - when the KPI sheet contains zero or multiple literal `KPI` header candidates
@@ -205,7 +242,9 @@ The cases cover sheet operations, middle and boundary row/column operations,
 net-zero combinations, simultaneous row and column edits, content-only changes,
 stale worksheet dimensions, exact sheet-name inventories, KPI membership,
 duplicates, ordering and unresolved values, `#REF!` lexical edge cases,
-missing/unexpected files, report filtering, and report generation.
+formula-cache changes, shared formulas, automatic A1 shifts, formula removal or
+hardcoding, meaningful/placeholder value changes, missing/unexpected files,
+report filtering, and report generation.
 
 ## Project layout
 
@@ -213,6 +252,7 @@ missing/unexpected files, report filtering, and report generation.
 src/pops_anomaly_detector/
   ooxml.py          secure, read-only workbook structure extraction
   alignment.py      row/column inference and separability validation
+  formula_logic.py  conservative logical formula normalization
   analysis.py       file pairing and result aggregation
   reporting.py      self-contained HTML and JSON output
   cli.py            command-line interface

@@ -177,6 +177,7 @@ class SemanticDetectorTests(unittest.TestCase):
             "COLUMNS_DELETED",
         }
         self.assertTrue(structural.isdisjoint(item.code for item in country.findings))
+        self.assertFalse(self._findings(country, "PREFILLED_VALUE_CHANGED"))
 
     def test_duplicate_kpi_identifiers_are_not_collapsed_to_a_set(self) -> None:
         _run, country = self._pair(

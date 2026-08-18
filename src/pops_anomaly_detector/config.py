@@ -17,6 +17,7 @@ class AnalysisConfig:
     max_uncompressed_bytes: int = 1_000_000_000
     max_xml_part_bytes: int = 300_000_000
     max_cells_per_sheet: int = 5_000_000
+    max_comparison_cells_per_sheet: int = 500_000
     kpi_header_scan_rows: int = 200
     max_kpi_semantic_cells: int = 250_000
     max_active_rows: int = 100_000
@@ -41,6 +42,7 @@ class AnalysisConfig:
             max_uncompressed_bytes=self.max_uncompressed_bytes,
             max_xml_part_bytes=self.max_xml_part_bytes,
             max_cells_per_sheet=self.max_cells_per_sheet,
+            max_comparison_cells_per_sheet=self.max_comparison_cells_per_sheet,
             kpi_header_scan_rows=self.kpi_header_scan_rows,
             max_kpi_semantic_cells=self.max_kpi_semantic_cells,
             max_active_rows=self.max_active_rows,

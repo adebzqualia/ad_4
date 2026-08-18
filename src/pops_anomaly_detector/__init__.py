@@ -1,6 +1,6 @@
 """POPS workbook anomaly detector."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .analysis import analyze_directories
 from .config import AnalysisConfig

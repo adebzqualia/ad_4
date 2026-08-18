@@ -65,6 +65,31 @@ class KpiComparison:
 
 
 @dataclass(slots=True)
+class CellSnapshot:
+    """Bounded semantic evidence for one nonblank scalar or formula cell.
+
+    Cached formula results populate the value fields for audit purposes only;
+    formula identity is represented exclusively by the ``formula_*`` fields.
+    """
+
+    coordinate: str
+    row: int
+    col: int
+    has_formula: bool
+    display_value: str | None
+    comparison_key: str | None
+    value_kind: str
+    confidence: str
+    formula_status: str = "NONE"
+    formula_type: str | None = None
+    formula_text: str | None = None
+    formula_shape: str | None = None
+    formula_relative: str | None = None
+    formula_group: str | None = None
+    formula_range: str | None = None
+
+
+@dataclass(slots=True)
 class SheetMetrics:
     active_rows: int = 0
     active_columns: int = 0
@@ -95,6 +120,10 @@ class SheetComparison:
     sent_metrics: SheetMetrics | None
     received_metrics: SheetMetrics | None
     kpi_comparison: KpiComparison | None = None
+    formula_changed_count: int = 0
+    formula_unresolved_count: int = 0
+    value_changed_count: int = 0
+    value_unresolved_count: int = 0
     row_operations: list[AxisOperation] = field(default_factory=list)
     column_operations: list[AxisOperation] = field(default_factory=list)
     alignment_notes: list[str] = field(default_factory=list)
@@ -136,6 +165,10 @@ class CountryMetrics:
     kpi_received_count: int = 0
     kpi_missing_count: int = 0
     kpi_unexpected_count: int = 0
+    formula_changed_count: int = 0
+    formula_unresolved_count: int = 0
+    value_changed_count: int = 0
+    value_unresolved_count: int = 0
     sheet_names_match: bool = True
     finding_count: int = 0
 
@@ -202,11 +235,19 @@ class RunResult:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         category_definitions = (
-            ("STRUCTURAL", "Structural anomalies", "HIGH"),
-            ("KPI_INTEGRITY", "KPI integrity anomalies", "HIGH"),
-            ("FORMULA_INTEGRITY", "Formula integrity anomalies", "HIGH"),
+            ("STRUCTURAL", "Structural anomalies"),
+            ("KPI_INTEGRITY", "KPI integrity anomalies"),
+            ("FORMULA_INTEGRITY", "Formula integrity anomalies"),
+            ("VALUE_INTEGRITY", "Value integrity anomalies"),
         )
-        severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+        severity_order = {
+            "CRITICAL": 0,
+            "HIGH": 10,
+            "MEDIUM": 20,
+            "WARNING": 30,
+            "LOW": 40,
+            "INFO": 50,
+        }
         for serialized, country in zip(payload["countries"], self.countries, strict=True):
             serialized["report_href"] = f"countries/{country.report_filename}"
             serialized["metrics"].update(
@@ -217,19 +258,37 @@ class RunResult:
                 }
             )
             category_results: list[dict[str, Any]] = []
-            for code, label, default_severity in category_definitions:
-                findings = [item for item in country.findings if item.category == code]
-                severity = max(
-                    (item.severity for item in findings),
-                    key=lambda item: severity_rank.get(item, 0),
-                    default=default_severity,
+            definitions = list(category_definitions)
+            known_categories = {code for code, _label in definitions}
+            for code in sorted(
+                {item.category for item in country.findings} - known_categories
+            ):
+                definitions.append(
+                    (code, code.replace("_", " ").title())
                 )
+            for code, label in definitions:
+                findings = [item for item in country.findings if item.category == code]
+                severity = min(
+                    (item.severity.upper() for item in findings if item.severity),
+                    key=lambda item: (severity_order.get(item, 999), item),
+                    default=None,
+                )
+                if not findings and code == "STRUCTURAL" and country.comparison_state != "PAIRED":
+                    status = "NOT_RUN"
+                elif severity in {"CRITICAL", "HIGH"}:
+                    status = "ERROR"
+                elif severity in {"MEDIUM", "WARNING"}:
+                    status = "WARNING"
+                elif findings:
+                    status = "INFO"
+                else:
+                    status = "OK"
                 category_results.append(
                     {
                         "code": code,
                         "label": label,
                         "severity": severity,
-                        "status": "ERROR" if findings else "OK",
+                        "status": status,
                         "finding_count": len(findings),
                     }
                 )

@@ -50,6 +50,10 @@ _FINDING_LABELS = {
     "KPI_IDENTIFIER_UNRESOLVED": "KPI identifier unresolved",
     "KPI_ORDER_CHANGED": "KPI order changed",
     "REFERENCE_ERRORS_INCREASED": "#REF! errors increased",
+    "FORMULA_REPLACED_WITH_VALUE": "Formula replaced with value",
+    "FORMULA_REMOVED": "Formula removed",
+    "FORMULA_MODIFIED": "Formula modified",
+    "PREFILLED_VALUE_CHANGED": "Prefilled value changed",
 }
 
 _FINDING_ORDER = {
@@ -68,18 +72,24 @@ _FINDING_ORDER = {
     "KPI_IDENTIFIER_UNRESOLVED": 150,
     "KPI_ORDER_CHANGED": 160,
     "REFERENCE_ERRORS_INCREASED": 210,
+    "FORMULA_REPLACED_WITH_VALUE": 220,
+    "FORMULA_REMOVED": 230,
+    "FORMULA_MODIFIED": 240,
+    "PREFILLED_VALUE_CHANGED": 310,
 }
 
 _CATEGORY_LABELS = {
     "STRUCTURAL": "Structural anomalies",
     "KPI_INTEGRITY": "KPI integrity anomalies",
     "FORMULA_INTEGRITY": "Formula integrity anomalies",
+    "VALUE_INTEGRITY": "Value integrity anomalies",
 }
 
 _CATEGORY_ORDER = {
     "STRUCTURAL": 10,
     "KPI_INTEGRITY": 20,
     "FORMULA_INTEGRITY": 30,
+    "VALUE_INTEGRITY": 40,
 }
 
 _SEVERITY_ORDER = {
@@ -206,7 +216,7 @@ thead th { color: #344054; background: #f9fafb; border-top: 0; font-size: .78rem
 tbody th { font-weight: 700; }
 tbody tr:hover { background: #fcfcfd; }
 .global-table { min-width: 1080px; }
-.sheet-table { min-width: 1280px; }
+.sheet-table { min-width: 1440px; }
 .cell-title { font-weight: 700; }
 .cell-meta, .muted { color: var(--subtle); font-size: .84rem; }
 .cell-meta { margin-top: .18rem; }
@@ -252,6 +262,16 @@ progress { width: 100%; height: .75rem; accent-color: var(--accent); }
 .mini-dl dt, .audit-dl dt { color: var(--muted); font-weight: 650; }
 .mini-dl dd, .audit-dl dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 .evidence-list, .notes-list { margin: .45rem 0 0; padding-left: 1.2rem; }
+.finding[data-category="FORMULA_INTEGRITY"] .evidence-list,
+.finding[data-category="VALUE_INTEGRITY"] .evidence-list {
+  display: grid; gap: .35rem; padding-left: 0; list-style: none;
+  font: .82rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.finding[data-category="FORMULA_INTEGRITY"] .evidence-list li,
+.finding[data-category="VALUE_INTEGRITY"] .evidence-list li {
+  padding: .45rem .55rem; overflow-wrap: anywhere; white-space: pre-wrap;
+  border: 1px solid var(--line-soft); border-radius: .35rem; background: #f9fafb;
+}
 details { margin-top: .55rem; }
 summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700; }
 .sheet-evidence-row > td { padding: .35rem .8rem .8rem; background: #fcfcfd; }
@@ -261,6 +281,10 @@ summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700;
 .sheet-evidence .mini-dl dd { overflow-wrap: break-word; word-break: normal; }
 .reference-errors { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .reference-errors--present { color: var(--error); font-weight: 700; }
+.cell-integrity { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.cell-integrity .cell-meta { white-space: normal; }
+.cell-integrity__item { display: block; }
+.cell-integrity__item--changed { color: var(--warn); font-weight: 700; }
 .sheet-inventory { padding: 0; }
 .sheet-inventory > summary { width: 100%; padding: 1rem; }
 .sheet-inventory[open] > summary { border-bottom: 1px solid var(--line-soft); }
@@ -579,7 +603,7 @@ def _maximum_severity(findings: Iterable[Finding]) -> str | None:
 
 
 def _category_results(country: CountryResult) -> list[dict[str, object]]:
-    grouped: dict[str, list[Finding]] = {"STRUCTURAL": []}
+    grouped: dict[str, list[Finding]] = {category: [] for category in _CATEGORY_ORDER}
     for finding in country.findings:
         grouped.setdefault(finding.category.upper(), []).append(finding)
     results: list[dict[str, object]] = []
@@ -589,7 +613,9 @@ def _category_results(country: CountryResult) -> list[dict[str, object]]:
     ):
         findings = grouped[category]
         maximum = _maximum_severity(findings)
-        if maximum in {"CRITICAL", "HIGH"}:
+        if not findings and category == "STRUCTURAL" and country.comparison_state != "PAIRED":
+            status = "NOT_RUN"
+        elif maximum in {"CRITICAL", "HIGH"}:
             status = "ERROR"
         elif maximum in {"MEDIUM", "WARNING"}:
             status = "WARNING"
@@ -693,6 +719,8 @@ def _unit_label(code: str, count: int) -> str:
         unit = "KPI"
     elif "REFERENCE_ERROR" in code or "REF_ERROR" in code:
         unit = "cell"
+    elif code.startswith("FORMULA") or code.startswith("PREFILLED_VALUE"):
+        unit = "cell"
     else:
         unit = "case"
     return f"{count:,} {unit if count == 1 else unit + 's'}"
@@ -769,7 +797,7 @@ def _global_rollup_html(run: RunResult) -> str:
         )
     return (
         '<div class="table-wrap" tabindex="0" role="region" aria-label="Anomaly roll-up">'
-        '<table><caption>Findings count operations or unresolved cases; affected units count rows, columns, or sheets.</caption>'
+        '<table><caption>Findings count operations or unresolved cases; affected units count rows, columns, sheets, KPI identifiers, or cells.</caption>'
         "<thead><tr><th scope=\"col\">Category</th><th scope=\"col\">Type</th><th scope=\"col\">Findings</th>"
         "<th scope=\"col\">Affected units</th><th scope=\"col\">Countries</th>"
         "<th scope=\"col\">Sheets</th><th scope=\"col\">Severity</th></tr></thead>"
@@ -858,9 +886,34 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
         "COLUMNS": "columns",
         "KPI_IDENTIFIERS": "KPI identifiers",
         "REFERENCE_ERRORS": "#REF! reference errors",
+        "FORMULAS": "aligned formulas",
+        "PREFILLED_VALUES": "aligned prefilled values",
     }
     scope_text = ", ".join(scope_labels.get(item, item.replace("_", " ").lower()) for item in run.scope)
     scope_text = scope_text or "workbook evidence"
+    formula_changes = sum(
+        int(getattr(country.metrics, "formula_changed_count", 0))
+        for country in run.countries
+    )
+    formula_unresolved = sum(
+        int(getattr(country.metrics, "formula_unresolved_count", 0))
+        for country in run.countries
+    )
+    value_changes = sum(
+        int(getattr(country.metrics, "value_changed_count", 0))
+        for country in run.countries
+    )
+    value_unresolved = sum(
+        int(getattr(country.metrics, "value_unresolved_count", 0))
+        for country in run.countries
+    )
+    run_severity = (
+        "HIGH"
+        if summary.high_findings
+        else "MEDIUM"
+        if getattr(summary, "medium_findings", 0)
+        else None
+    )
     notices = _notice("Run notes", run.warnings, "warn")
     body = f"""
 <header class="topbar">
@@ -878,7 +931,7 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
     </div>
     <div class="hero__status" aria-label="Run status">
       {_status_badge('ERROR' if summary.error else 'OK')}
-      {_severity_badge('HIGH' if summary.high_findings else None)}
+      {_severity_badge(run_severity)}
     </div>
   </div>
   {notices}
@@ -892,6 +945,8 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
       {_kpi('ERROR', _number(summary.error), 'Workbooks requiring action', 'error' if summary.error else '')}
       {_kpi('HIGH findings', _number(summary.high_findings), f'Across {summary.affected_countries:,} countries', 'error' if summary.high_findings else '')}
       {_kpi('MEDIUM findings', _number(getattr(summary, 'medium_findings', 0)), 'Review recommended', 'warn' if getattr(summary, 'medium_findings', 0) else '')}
+      {_kpi('Formula changes', _number(formula_changes), f'{formula_unresolved:,} unresolved or skipped', 'warn' if formula_changes or formula_unresolved else '')}
+      {_kpi('Prefilled value changes', _number(value_changes), f'{value_unresolved:,} unresolved or skipped', 'warn' if value_changes or value_unresolved else '')}
     </div>
   </section>
   <section class="section" aria-labelledby="coverage-heading">
@@ -911,7 +966,7 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
   </section>
   <section class="section" aria-labelledby="rollup-heading">
     <div class="section__heading"><h2 id="rollup-heading">Anomalies by category and type</h2></div>
-    <p class="section-intro">Structural additions and deletions are counted independently. KPI and formula-integrity findings are reported separately with their own criticality.</p>
+    <p class="section-intro">Structural additions and deletions are counted independently. KPI, formula, and prefilled-value findings are reported in separate integrity categories with their own criticality.</p>
     {_global_rollup_html(run)}
   </section>
   <section class="section" aria-labelledby="countries-heading">
@@ -936,11 +991,13 @@ def _render_global_report(run: RunResult, filenames: Mapping[int, str]) -> str:
       <ul class="method-list">
         <li>Sheet identity is matched by exact Excel sheet name. A rename is reported conservatively as one deleted sheet and one added sheet.</li>
         <li>Active worksheet extents are derived from stored cells and structural evidence such as row or column properties, ranges, tables, and drawing anchors. Excel's declared dimension is retained as diagnostic evidence rather than trusted on its own.</li>
-        <li>Inserted and deleted rows and columns are inferred by aligning structural signatures. Ambiguous mappings are surfaced as a HIGH manual-review finding instead of being silently treated as unchanged.</li>
+        <li>Inserted and deleted rows and columns are inferred by aligning structural signatures. Recalculated array/data-table outputs and refresh-driven PivotTable/query-table cells and ranges are excluded from those signatures. Ambiguous mappings are surfaced as a HIGH manual-review finding instead of being silently treated as unchanged.</li>
         <li>Operation counts, not net deltas, determine structural status. Equal additions and deletions may leave the same final dimensions.</li>
         <li>The KPI sheet is checked for an identifiable KPI column and differences in normalized KPI identifiers and order.</li>
-        <li>#REF! counts include formula text and cached error cells; per-sheet evidence shows both components, which can overlap in the same cell.</li>
-        <li>Other changed values, formatting intent, charts, and broader business-rule validation remain outside this report's scope.</li>
+        <li>#REF! counts include formula text and cached error cells; per-sheet evidence shows both components, which can overlap. Only an increase in explicit formula tokens creates a HIGH finding because an unchanged formula's cache may be recalculated by Excel.</li>
+        <li>Formulas are compared only after logical row and column alignment. Stored cached results are ignored; formulas inside removed axes or sheets with unresolved mappings are skipped rather than compared at the wrong coordinates.</li>
+        <li>Meaningful prefilled sent values are compared at logically aligned cells. Blank, zero, and lone-hyphen placeholders, plus stored array-formula, data-table, PivotTable, query-table, and calculated-column/total outputs, are excluded. Cells inside removed axes or unresolved mappings are skipped and counted separately.</li>
+        <li>Formatting intent, charts, and broader business-rule validation remain outside this report's scope.</li>
       </ul>
     </div>
   </section>
@@ -1070,7 +1127,17 @@ def _finding_groups_html(
                 "sheets, including missing, unexpected, ambiguous, and reordered identifiers."
             )
         elif category == "FORMULA_INTEGRITY":
-            intro = "Reference-error findings compare #REF! cells in sent and received sheets."
+            intro = (
+                "Formula integrity covers #REF! errors and MEDIUM changes where an aligned "
+                "sent formula was removed, replaced by a value, or logically modified. "
+                "Cached formula results are ignored."
+            )
+        elif category == "VALUE_INTEGRITY":
+            intro = (
+                "Prefilled sent values are compared with their logically aligned received "
+                "cells. Blank, zero, and lone-hyphen placeholders are fillable and excluded. "
+                "Confirmed changes are MEDIUM; cells that cannot be mapped safely are skipped."
+            )
         else:
             intro = "Findings in this category are grouped by anomaly type and sheet."
 
@@ -1282,6 +1349,47 @@ def _reference_errors_html(comparison: SheetComparison) -> str:
     )
 
 
+def _cell_integrity_html(comparison: SheetComparison) -> str:
+    formula_changes = int(getattr(comparison, "formula_changed_count", 0))
+    value_changes = int(getattr(comparison, "value_changed_count", 0))
+    formula_unresolved = int(getattr(comparison, "formula_unresolved_count", 0))
+    value_unresolved = int(getattr(comparison, "value_unresolved_count", 0))
+    formula_class = " cell-integrity__item--changed" if formula_changes else ""
+    value_class = " cell-integrity__item--changed" if value_changes else ""
+    unresolved = formula_unresolved + value_unresolved
+    unresolved_html = ""
+    if unresolved:
+        unresolved_html = (
+            f'<span class="cell-meta">Skipped/unresolved: {unresolved:,} '
+            f"({formula_unresolved:,} formula / {value_unresolved:,} value)</span>"
+        )
+    return (
+        f'<span class="cell-integrity__item{formula_class}">Formula changes: '
+        f"{formula_changes:,}</span>"
+        f'<span class="cell-integrity__item{value_class}">Value changes: '
+        f"{value_changes:,}</span>{unresolved_html}"
+    )
+
+
+def _cell_integrity_evidence_html(comparison: SheetComparison) -> str:
+    formula_changes = int(getattr(comparison, "formula_changed_count", 0))
+    value_changes = int(getattr(comparison, "value_changed_count", 0))
+    formula_unresolved = int(getattr(comparison, "formula_unresolved_count", 0))
+    value_unresolved = int(getattr(comparison, "value_unresolved_count", 0))
+    if not any((formula_changes, value_changes, formula_unresolved, value_unresolved)):
+        return ""
+    return (
+        '<div class="kpi-evidence"><h4>Aligned cell-integrity comparison</h4>'
+        '<dl class="mini-dl">'
+        f"<dt>Formula changes</dt><dd>{formula_changes:,}</dd>"
+        f"<dt>Value changes</dt><dd>{value_changes:,}</dd>"
+        f"<dt>Formula skipped/unresolved</dt><dd>{formula_unresolved:,}</dd>"
+        f"<dt>Value skipped/unresolved</dt><dd>{value_unresolved:,}</dd>"
+        "</dl><p class=\"muted\">A1 locations and sent → received formulas or values "
+        "are listed in the linked finding evidence.</p></div>"
+    )
+
+
 def _kpi_snapshot_html(label: str, snapshot: object | None) -> str:
     if snapshot is None:
         return f'<div class="inventory-panel"><h4>{_e(label)}</h4><p class="muted">Not available.</p></div>'
@@ -1355,7 +1463,8 @@ def _sheet_evidence_html(comparison: SheetComparison) -> str:
         '<dl class="mini-dl">'
         f"{_metrics_evidence('Sent', comparison.sent_metrics)}"
         f"{_metrics_evidence('Received', comparison.received_metrics)}"
-        f"</dl>{_kpi_comparison_html(comparison)}{notes}</details>"
+        f"</dl>{_kpi_comparison_html(comparison)}"
+        f"{_cell_integrity_evidence_html(comparison)}{notes}</details>"
     )
 
 
@@ -1498,18 +1607,20 @@ def _sheet_table_html(country: CountryResult, finding_anchors: Mapping[str, str]
             f"<td>{_extent_delta(comparison)}</td>"
             f"<td>{_axis_operations_html(comparison.row_operations, 'ROW', comparison.status)}</td>"
             f"<td>{_axis_operations_html(comparison.column_operations, 'COLUMN', comparison.status)}</td>"
-            f'<td class="reference-errors">{_reference_errors_html(comparison)}</td>'
+            f'<td class="reference-errors cell-integrity">{_reference_errors_html(comparison)}'
+            f'<div class="kpi-evidence">{_cell_integrity_html(comparison)}</div></td>'
             "</tr>"
             '<tr class="sheet-evidence-row"><td colspan="8">'
             f"{_sheet_evidence_html(comparison)}</td></tr>"
         )
     return (
         '<div class="table-wrap" tabindex="0" role="region" aria-label="Sheet comparison matrix">'
-        '<table class="sheet-table"><caption>Active extents, #REF! counts, and inferred operations are shown per sheet; expanded evidence uses the full table width.</caption>'
+        '<table class="sheet-table"><caption>Active extents, #REF! counts, aligned formula/value changes, and inferred operations are shown per sheet; expanded evidence uses the full table width.</caption>'
         "<thead><tr><th scope=\"col\">Status</th><th scope=\"col\">Sheet</th>"
         "<th scope=\"col\">Sent active extent</th><th scope=\"col\">Received active extent</th>"
         "<th scope=\"col\">Extent delta</th><th scope=\"col\">Row operations</th>"
-        "<th scope=\"col\">Column operations</th><th scope=\"col\">#REF! cells</th></tr></thead>"
+        "<th scope=\"col\">Column operations</th>"
+        "<th scope=\"col\">#REF! cells / formula / value changes</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table></div>"
     )
 
@@ -1542,11 +1653,26 @@ def _country_kpis(country: CountryResult) -> str:
             f"{int(getattr(metrics, 'kpi_missing_count', 0)):,} missing / "
             f"{int(getattr(metrics, 'kpi_unexpected_count', 0)):,} unexpected"
         )
+        formula_changes = int(getattr(metrics, "formula_changed_count", 0))
+        formula_unresolved = int(getattr(metrics, "formula_unresolved_count", 0))
+        formula_help = f"{formula_unresolved:,} skipped/unresolved"
+        value_changes = int(getattr(metrics, "value_changed_count", 0))
+        value_unresolved = int(getattr(metrics, "value_unresolved_count", 0))
+        value_help = f"{value_unresolved:,} skipped/unresolved"
     else:
-        sheets = rows = columns = refs = kpis = "—"
-        sheet_help = row_help = column_help = ref_help = kpi_help = "Not compared"
+        sheets = rows = columns = refs = kpis = formula_changes = value_changes = "—"
+        formula_unresolved = value_unresolved = 0
+        sheet_help = row_help = column_help = ref_help = kpi_help = formula_help = value_help = "Not compared"
+    result_tone = (
+        "error"
+        if country.overall_status.upper() == "ERROR"
+        else "warn"
+        if country.overall_status.upper() in {"WARNING", "WARN"}
+        else "ok"
+    )
+    affected_tone = "error" if high_count else "warn" if medium_count else ""
     return (
-        _kpi("Result", country.overall_status, country.comparison_state.replace("_", " "), "error" if country.overall_status.upper() == "ERROR" else "ok")
+        _kpi("Result", country.overall_status, country.comparison_state.replace("_", " "), result_tone)
         + _kpi("HIGH findings", _number(high_count), "Immediate action", "error" if high_count else "")
         + _kpi("MEDIUM findings", _number(medium_count), "Review recommended", "warn" if medium_count else "")
         + _kpi("Sheets", sheets, sheet_help, "accent")
@@ -1554,7 +1680,9 @@ def _country_kpis(country: CountryResult) -> str:
         + _kpi("Columns + / −", columns, column_help, "error" if metrics.columns_added or metrics.columns_deleted else "")
         + _kpi("#REF! cells", refs, ref_help, "error" if comparable and int(getattr(metrics, "received_ref_errors", 0)) else "")
         + _kpi("KPI identifiers", kpis, kpi_help, "error" if comparable and (int(getattr(metrics, "kpi_missing_count", 0)) or int(getattr(metrics, "kpi_unexpected_count", 0))) else "")
-        + _kpi("Affected sheets", _number(metrics.affected_sheet_count), "With one or more findings", "error" if metrics.affected_sheet_count else "")
+        + _kpi("Formula changes", formula_changes, formula_help, "warn" if comparable and (formula_changes or formula_unresolved) else "")
+        + _kpi("Prefilled value changes", value_changes, value_help, "warn" if comparable and (value_changes or value_unresolved) else "")
+        + _kpi("Affected sheets", _number(metrics.affected_sheet_count), "With one or more findings", affected_tone if metrics.affected_sheet_count else "")
     )
 
 
@@ -1616,7 +1744,7 @@ def _render_country_report(
     <div>
       <p class="eyebrow">Country anomaly report</p>
       <h1>{_e(country.display_name)}</h1>
-      <p class="lede">{_e(country.sent_file.name if country.sent_file else 'No sent workbook')} → {_e(country.received_file.name if country.received_file else 'No received workbook')}. This report covers workbook structure, KPI identifier integrity, and #REF! reference-error evidence.</p>
+      <p class="lede">{_e(country.sent_file.name if country.sent_file else 'No sent workbook')} → {_e(country.received_file.name if country.received_file else 'No received workbook')}. This report covers workbook structure, KPI identifiers, #REF! errors, aligned formulas, and aligned prefilled values.</p>
     </div>
     <div class="hero__status" aria-label="Country result">
       {_status_badge(country.overall_status)}
@@ -1636,7 +1764,7 @@ def _render_country_report(
   </div>
   <section class="section" aria-labelledby="sheets-heading">
     <div class="section__heading"><h2 id="sheets-heading">Sheet comparison</h2></div>
-    <p class="section-intro">Active extents, inferred row and column operations, KPI evidence, and #REF! cell counts are shown for every available sheet comparison.</p>
+    <p class="section-intro">Active extents, inferred row and column operations, KPI evidence, #REF! counts, and aligned formula/value change counts are shown for every available sheet comparison.</p>
     {_sheet_table_html(country, anchors_by_id)}
   </section>
   <section class="section" aria-labelledby="sources-heading">
@@ -1649,11 +1777,13 @@ def _render_country_report(
       <ul class="method-list">
         <li>Sheet names are compared exactly. A renamed sheet is conservatively represented as a deletion and an addition.</li>
         <li>Active extents are reconstructed from OOXML structural evidence; Excel's declared dimension is displayed as evidence but is not trusted as the sole source.</li>
-        <li>Row and column operations are inferred through structural sequence alignment. Confidence and supporting evidence are shown for auditability; an unresolved alignment is itself a HIGH finding.</li>
+        <li>Row and column operations are inferred through structural sequence alignment. Recalculated array/data-table outputs and refresh-driven PivotTable/query-table cells and ranges are excluded from those signatures. Confidence and supporting evidence are shown for auditability; an unresolved alignment is itself a HIGH finding.</li>
         <li>Extent deltas are informational. Structural status uses detected operations, so an addition and deletion can be reported even when the final row or column count is unchanged.</li>
         <li>Only the sheet named KPI is evaluated for KPI identifiers. The detector resolves the column headed KPI and compares normalized identifiers, duplicates, and order.</li>
-        <li>#REF! totals count unique cells; cached error values and formula-text references are shown separately because one cell can provide both forms of evidence.</li>
-        <li>Other formula correctness, changed values, formatting intent, and broader business-rule validation are outside this report's current scope.</li>
+        <li>#REF! totals count unique cells; cached error values and formula-text references are shown separately because one cell can provide both forms of evidence. Only an increase in explicit formula tokens creates a HIGH finding; cache-only changes remain metrics.</li>
+        <li>Formula presence and normalized formula logic are compared after logical row and column alignment. Cached results are ignored. Cells inside structurally removed axes, and sheets whose mappings are unresolved, are skipped.</li>
+        <li>Meaningful prefilled values from the sent workbook are compared at their logically aligned received cells. Blank, zero, and lone-hyphen placeholders, plus stored array-formula, data-table, PivotTable, query-table, and calculated-column/total outputs, are excluded. Structurally removed or unresolved cells are skipped rather than reported as content changes.</li>
+        <li>Formatting intent, charts, and broader business-rule validation remain outside this report's current scope.</li>
       </ul>
     </div>
   </section>

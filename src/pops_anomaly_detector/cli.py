@@ -39,6 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-active-rows", type=_positive_int, default=100_000)
     parser.add_argument("--max-active-columns", type=_positive_int, default=16_384)
     parser.add_argument("--max-cells-per-sheet", type=_positive_int, default=5_000_000)
+    parser.add_argument(
+        "--max-comparison-cells-per-sheet",
+        type=_positive_int,
+        default=500_000,
+        help="Maximum retained formula/nonblank cells per worksheet for semantic checks.",
+    )
     parser.add_argument("--kpi-header-scan-rows", type=_positive_int, default=200)
     parser.add_argument("--max-kpi-semantic-cells", type=_positive_int, default=250_000)
     parser.add_argument("--alignment-band", type=_positive_int, default=240)
@@ -60,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
         max_active_rows=args.max_active_rows,
         max_active_columns=args.max_active_columns,
         max_cells_per_sheet=args.max_cells_per_sheet,
+        max_comparison_cells_per_sheet=args.max_comparison_cells_per_sheet,
         kpi_header_scan_rows=args.kpi_header_scan_rows,
         max_kpi_semantic_cells=args.max_kpi_semantic_cells,
         alignment_band=args.alignment_band,

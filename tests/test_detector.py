@@ -138,7 +138,14 @@ class StructuralDetectorTests(unittest.TestCase):
         self.assertEqual(country.metrics.rows_deleted, 0)
         self.assertEqual(country.metrics.columns_added, 0)
         self.assertEqual(country.metrics.columns_deleted, 0)
-        self.assertEqual(country.overall_status, "OK")
+        # The expanded detector may correctly report these as formula/value
+        # integrity findings; this regression remains specifically about not
+        # misclassifying same-coordinate edits as structural axis operations.
+        self.assertIn("FORMULA_MODIFIED", {item.code for item in country.findings})
+        self.assertIn(
+            "PREFILLED_VALUE_CHANGED",
+            {item.code for item in country.findings},
+        )
 
     def test_sheet_addition_and_deletion_are_both_reported(self) -> None:
         overview = make_grid(prefix="overview")

@@ -9,7 +9,9 @@ without a spreadsheet library normalising those details for us.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import tempfile
 from typing import Literal, Mapping, Sequence, TypeAlias
 from xml.etree import ElementTree as ET
 import zipfile
@@ -47,6 +49,9 @@ class Cell:
     formula: str | None = None
     style: str = "default"
     data_type: Literal["auto", "e"] = "auto"
+    formula_type: Literal["normal", "shared", "array", "dataTable"] = "normal"
+    shared_index: int | None = None
+    formula_ref: str | None = None
 
 
 CellLike: TypeAlias = Cell | Scalar | None
@@ -80,6 +85,40 @@ def _tag(namespace: str, local_name: str) -> str:
 
 def _xml_bytes(root: ET.Element) -> bytes:
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def read_xlsx_part(path: Path, part_name: str) -> bytes:
+    """Read one package part for a focused OOXML fixture extension."""
+
+    with zipfile.ZipFile(path, "r") as archive:
+        return archive.read(part_name)
+
+
+def update_xlsx_parts(path: Path, updates: Mapping[str, bytes]) -> Path:
+    """Replace or add package parts without normalizing the workbook."""
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.stem}-",
+        suffix=".xlsx",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        with zipfile.ZipFile(path, "r") as source, zipfile.ZipFile(
+            temporary_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as target:
+            for info in source.infolist():
+                if info.filename not in updates:
+                    target.writestr(info, source.read(info.filename))
+            for part_name, payload in updates.items():
+                target.writestr(part_name, payload)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return path
 
 
 def _as_cell(value: CellLike) -> Cell:
@@ -151,6 +190,32 @@ def error_cell(
     if not value.startswith("#"):
         raise ValueError("Excel error values must start with '#'.")
     return Cell(value=value, formula=formula, style=style, data_type="e")
+
+
+def shared_formula_cell(
+    value: Scalar | None,
+    *,
+    shared_index: int,
+    formula: str | None = None,
+    formula_ref: str | None = None,
+    style: str = "default",
+) -> Cell:
+    """Return a shared-formula master or follower with an optional cache."""
+
+    if shared_index < 0:
+        raise ValueError("Shared formula indices cannot be negative.")
+    return Cell(
+        value=value,
+        formula=formula,
+        style=style,
+        formula_type="shared",
+        shared_index=shared_index,
+        formula_ref=formula_ref,
+    )
+
+
+def _has_formula(cell: Cell) -> bool:
+    return cell.formula is not None or cell.formula_type != "normal"
 
 
 def replace_cell(
@@ -389,7 +454,7 @@ def _shared_string_values(sheets: Sequence[tuple[str, Matrix]]) -> list[str]:
             for cell in row:
                 if (
                     cell.data_type == "auto"
-                    and cell.formula is None
+                    and not _has_formula(cell)
                     and isinstance(cell.value, str)
                     and cell.value not in seen
                 ):
@@ -437,7 +502,8 @@ def _worksheet(
     for row_index, values in enumerate(rows, start=1):
         row = ET.SubElement(sheet_data, _tag(SPREADSHEET_NS, "row"), r=str(row_index))
         for column_index, cell in enumerate(values, start=1):
-            if cell.value is None and cell.formula is None:
+            has_formula = _has_formula(cell)
+            if cell.value is None and not has_formula:
                 continue
             attributes = {
                 "r": f"{column_name(column_index)}{row_index}",
@@ -445,19 +511,42 @@ def _worksheet(
             }
             if cell.data_type == "e":
                 attributes["t"] = "e"
-            elif cell.formula is None and isinstance(cell.value, str):
+            elif not has_formula and isinstance(cell.value, str):
                 attributes["t"] = "s" if shared_string_ids is not None else "inlineStr"
-            elif cell.formula is None and isinstance(cell.value, bool):
+            elif not has_formula and isinstance(cell.value, bool):
                 attributes["t"] = "b"
-            elif cell.formula is not None and isinstance(cell.value, str):
+            elif has_formula and isinstance(cell.value, str):
                 attributes["t"] = "str"
             element = ET.SubElement(row, _tag(SPREADSHEET_NS, "c"), attributes)
-            if cell.formula is not None:
-                formula = ET.SubElement(element, _tag(SPREADSHEET_NS, "f"))
+            if has_formula:
+                formula_attributes: dict[str, str] = {}
+                if cell.formula_type == "shared":
+                    if cell.shared_index is None:
+                        raise ValueError("A shared formula cell requires shared_index.")
+                    formula_attributes.update(t="shared", si=str(cell.shared_index))
+                    if cell.formula_ref is not None:
+                        formula_attributes["ref"] = cell.formula_ref
+                elif cell.formula_type in {"array", "dataTable"}:
+                    if cell.shared_index is not None:
+                        raise ValueError(
+                            "shared_index is valid only for shared formulas."
+                        )
+                    formula_attributes["t"] = cell.formula_type
+                    if cell.formula_ref is not None:
+                        formula_attributes["ref"] = cell.formula_ref
+                elif cell.shared_index is not None or cell.formula_ref is not None:
+                    raise ValueError(
+                        "shared_index and formula_ref are valid only for shared formulas."
+                    )
+                formula = ET.SubElement(
+                    element,
+                    _tag(SPREADSHEET_NS, "f"),
+                    formula_attributes,
+                )
                 formula.text = cell.formula
             if (
                 cell.data_type == "auto"
-                and cell.formula is None
+                and not has_formula
                 and isinstance(cell.value, str)
             ):
                 if shared_string_ids is not None:
@@ -514,7 +603,7 @@ def write_xlsx(
     string_ids = {value: index for index, value in enumerate(strings)} if use_shared_strings else None
     occurrence_count = sum(
         cell.data_type == "auto"
-        and cell.formula is None
+        and not _has_formula(cell)
         and isinstance(cell.value, str)
         for _name, rows in normalized
         for row in rows

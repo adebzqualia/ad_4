@@ -7,6 +7,8 @@ import re
 import unicodedata
 import zipfile
 from collections import Counter
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterable
@@ -14,8 +16,25 @@ from typing import Iterable
 from . import __version__
 from .alignment import AlignmentUnresolved, align_axis, validate_separable_grid
 from .config import AnalysisConfig
-from .coordinates import index_to_column
+from .coordinates import (
+    MAX_EXCEL_COLUMN,
+    MAX_EXCEL_ROW,
+    CellRange,
+    index_to_column,
+    parse_range_reference,
+)
+from .formula_logic import (
+    FormulaComparisonUnresolved,
+    canonicalize_formula,
+    formula_compatibility_signature,
+    formula_has_ref_error,
+    formula_uses_single_compatibility,
+    neutralize_compatibility_identity,
+    normalize_dynamic_array_identity,
+    reference_agnostic_shape,
+)
 from .models import (
+    CellSnapshot,
     CountryMetrics,
     CountryResult,
     FileEvidence,
@@ -32,6 +51,33 @@ from .ooxml import SheetStructure, WorkbookReadError, WorkbookStructure, read_wo
 
 class InputDiscoveryError(RuntimeError):
     """Input directories are absent or filenames are ambiguous."""
+
+
+@dataclass(slots=True)
+class _CellComparisonContext:
+    """One exact-name worksheet pair and its validated logical coordinate map."""
+
+    sent: SheetStructure
+    received: SheetStructure
+    comparison: SheetComparison
+    row_mapping: dict[int, int] | None
+    column_mapping: dict[int, int] | None
+    reverse_row_mapping: dict[int, int] | None = field(init=False, default=None)
+    reverse_column_mapping: dict[int, int] | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        if self.row_mapping is not None:
+            self.reverse_row_mapping = {
+                actual: expected for expected, actual in self.row_mapping.items()
+            }
+        if self.column_mapping is not None:
+            self.reverse_column_mapping = {
+                actual: expected for expected, actual in self.column_mapping.items()
+            }
+
+    @property
+    def is_mappable(self) -> bool:
+        return self.row_mapping is not None and self.column_mapping is not None
 
 
 def _discover(directory: Path, recursive: bool) -> dict[str, Path]:
@@ -60,11 +106,18 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _file_evidence(path: Path, side: str) -> FileEvidence:
+def _file_evidence(path: Path, side: str, input_root: Path) -> FileEvidence:
+    try:
+        input_relative = path.resolve().relative_to(input_root.resolve()).as_posix()
+    except ValueError:
+        # Discovery normally guarantees containment. Keep evidence usable if a
+        # caller supplies a path outside the configured root instead of
+        # inventing a misleading parent path.
+        input_relative = path.name
     stat = path.stat()
     return FileEvidence(
         name=path.name,
-        relative_path=f"{side}/{path.name}",
+        relative_path=f"{side}/{input_relative}",
         size_bytes=stat.st_size,
         modified_at_utc=datetime.fromtimestamp(stat.st_mtime, UTC).isoformat().replace("+00:00", "Z"),
         sha256=_sha256(path),
@@ -421,9 +474,11 @@ def _reference_error_finding(
 ) -> Finding | None:
     sent_count = sent_sheet.metrics.ref_error_count
     received_count = received_sheet.metrics.ref_error_count
-    if received_count <= sent_count:
+    sent_explicit = sent_sheet.metrics.formula_ref_error_count
+    received_explicit = received_sheet.metrics.formula_ref_error_count
+    if received_explicit <= sent_explicit:
         return None
-    delta = received_count - sent_count
+    delta = received_explicit - sent_explicit
     evidence = [
         f"Sent: {sent_count} unique affected cell(s) "
         f"({sent_sheet.metrics.cached_ref_error_count} cached error; "
@@ -453,14 +508,656 @@ def _reference_error_finding(
         confidence="HIGH",
         scope="SHEET",
         message=(
-            f"Stored or explicit #REF! cells increased by {delta} in sheet "
-            f"{sent_sheet.name!r} ({sent_count} sent → {received_count} received)."
+            f"Formula cells containing an explicit #REF! token increased by {delta} in sheet "
+            f"{sent_sheet.name!r} ({sent_explicit} sent → {received_explicit} received)."
         ),
         sent_sheet_name=sent_sheet.name,
         received_sheet_name=received_sheet.name,
         unit_count=delta,
         evidence=evidence,
     )
+
+
+_CELL_FINDING_EVIDENCE_LIMIT = 40
+
+
+def _meaningful_prefilled_value(cell: CellSnapshot) -> bool:
+    """Return whether a sent literal is protected template content.
+
+    Empty cells are not retained as material cells. Numeric zero, textual zero,
+    and a lone hyphen are deliberately treated as input placeholders that a
+    country may complete without creating an anomaly.
+    """
+
+    if cell.has_formula or cell.comparison_key is None:
+        return False
+    if cell.comparison_key.startswith("NUMBER:"):
+        try:
+            return Decimal(cell.comparison_key.removeprefix("NUMBER:")) != 0
+        except InvalidOperation:
+            return False
+    if cell.comparison_key.startswith("TEXT:"):
+        normalized = unicodedata.normalize("NFKC", cell.display_value or "")
+        normalized = " ".join(normalized.split())
+        if normalized in {"", "-"}:
+            return False
+        try:
+            if Decimal(normalized) == 0:
+                return False
+        except InvalidOperation:
+            pass
+    return True
+
+
+def _formula_output_ranges(sheet: SheetStructure) -> list[CellRange]:
+    """Ranges whose non-anchor cells are calculated outputs, not prefills."""
+
+    ranges: list[CellRange] = list(sheet.generated_output_ranges)
+    seen = set(ranges)
+    for cell in sheet.material_cells:
+        if (
+            not cell.has_formula
+            or (cell.formula_type or "").casefold() not in {"array", "datatable"}
+            or not cell.formula_range
+        ):
+            continue
+        try:
+            bounds = parse_range_reference(cell.formula_range)
+        except ValueError:
+            # The formula itself remains comparable only as far as its parser
+            # permits. An invalid output range must not be expanded or guessed.
+            continue
+        if not (
+            bounds.min_row <= cell.row <= bounds.max_row
+            and bounds.min_col <= cell.col <= bounds.max_col
+        ):
+            continue
+        if bounds not in seen:
+            seen.add(bounds)
+            ranges.append(bounds)
+    return ranges
+
+
+def _cells_outside_ranges(
+    cells: list[CellSnapshot],
+    ranges: list[CellRange],
+) -> list[CellSnapshot]:
+    """Filter generated rectangles in O((n+r) log C) time.
+
+    A workbook can legitimately contain hundreds of thousands of material
+    cells and many calculated-output ranges. Scanning every range for every
+    cell would be quadratic. A row sweep with a Fenwick difference tree keeps
+    the check bounded by Excel's fixed 16,384-column axis without retaining a
+    second potentially huge set of covered coordinates.
+    """
+
+    if not cells or not ranges:
+        return list(cells)
+
+    events: dict[int, list[tuple[int, int, int]]] = {}
+    for bounds in ranges:
+        if not (
+            1 <= bounds.min_row <= bounds.max_row <= MAX_EXCEL_ROW
+            and 1 <= bounds.min_col <= bounds.max_col <= MAX_EXCEL_COLUMN
+        ):
+            # An invalid internal mask must never hang the Fenwick update or
+            # exempt unrelated template values.
+            continue
+        events.setdefault(bounds.min_row, []).append(
+            (bounds.min_col, bounds.max_col, 1)
+        )
+        events.setdefault(bounds.max_row + 1, []).append(
+            (bounds.min_col, bounds.max_col, -1)
+        )
+
+    tree = [0] * (MAX_EXCEL_COLUMN + 2)
+
+    def add(index: int, delta: int) -> None:
+        while index < len(tree):
+            tree[index] += delta
+            index += index & -index
+
+    def range_add(left: int, right: int, delta: int) -> None:
+        add(left, delta)
+        add(right + 1, -delta)
+
+    def point_value(index: int) -> int:
+        total = 0
+        while index:
+            total += tree[index]
+            index -= index & -index
+        return total
+
+    if not events:
+        return list(cells)
+
+    ordered_cells = cells
+    if any(
+        (left.row, left.col) > (right.row, right.col)
+        for left, right in zip(cells, cells[1:])
+    ):
+        ordered_cells = sorted(cells, key=lambda item: (item.row, item.col))
+
+    event_rows = sorted(events)
+    event_index = 0
+    outside: list[CellSnapshot] = []
+    for cell in ordered_cells:
+        while event_index < len(event_rows) and event_rows[event_index] <= cell.row:
+            for left, right, delta in events[event_rows[event_index]]:
+                range_add(left, right, delta)
+            event_index += 1
+        if point_value(cell.col) == 0:
+            outside.append(cell)
+    return outside
+
+
+def _protected_prefilled_cells(
+    sheet: SheetStructure,
+    excluded_coordinates: set[str] | None = None,
+) -> list[CellSnapshot]:
+    """Select meaningful template literals that are safe to compare."""
+
+    excluded = excluded_coordinates or set()
+    candidates = [
+        cell
+        for cell in sheet.material_cells
+        if _meaningful_prefilled_value(cell) and cell.coordinate not in excluded
+    ]
+    return _cells_outside_ranges(candidates, _formula_output_ranges(sheet))
+
+
+def _kpi_identity_coordinates(sheet: SheetStructure) -> set[str]:
+    """Cells already governed by the dedicated KPI-integrity comparison."""
+
+    snapshot = sheet.kpi_snapshot
+    coordinates = set(snapshot.header_candidates)
+    if snapshot.header_coordinate is not None:
+        coordinates.add(snapshot.header_coordinate)
+    coordinates.update(entry.coordinate for entry in snapshot.entries)
+    return coordinates
+
+
+def _cell_coordinate(row: int, col: int) -> str:
+    return f"{index_to_column(col)}{row}"
+
+
+def _trim_evidence(value: str, limit: int = 220) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _cell_description(cell: CellSnapshot | None) -> str:
+    if cell is None:
+        return "<blank>"
+    if cell.has_formula:
+        if cell.formula_text is not None:
+            return "=" + _trim_evidence(cell.formula_text)
+        if cell.formula_relative is not None:
+            return "<shared formula " + _trim_evidence(cell.formula_relative) + ">"
+        return "<unresolved formula>"
+    return f"{_trim_evidence(cell.display_value or '<blank>')!r} ({cell.value_kind})"
+
+
+def _casefold_sheet_lookup(workbook: WorkbookStructure) -> dict[str, SheetStructure]:
+    return {sheet.name.casefold(): sheet for sheet in workbook.sheets}
+
+
+def _formula_reference_resolver(
+    *,
+    side: str,
+    current: _CellComparisonContext,
+    contexts: dict[str, _CellComparisonContext],
+    sent_sheets: dict[str, SheetStructure],
+    received_sheets: dict[str, SheetStructure],
+):
+    """Build a resolver into the sent workbook's logical coordinate space."""
+
+    if side not in {"SENT", "RECEIVED"}:
+        raise ValueError(f"Unsupported formula side: {side!r}")
+    side_sheets = sent_sheets if side == "SENT" else received_sheets
+    other_sheets = received_sheets if side == "SENT" else sent_sheets
+
+    def resolve(
+        sheet_name: str | None,
+        row: int | None,
+        col: int | None,
+    ) -> tuple[str, int | None, int | None] | None:
+        if sheet_name is None:
+            target = current
+        else:
+            folded_name = sheet_name.casefold()
+            sheet = side_sheets.get(folded_name)
+            if sheet is None:
+                # External workbook references are outside the local topology.
+                # Their stored coordinates are stable for this comparison.
+                if sheet_name.startswith("[") and "]" in sheet_name:
+                    # OOXML external-book indexes can be renumbered between
+                    # packages. Without resolving the externalLinks graph, the
+                    # token is not a stable workbook identity.
+                    return None
+                # A name absent from both workbooks is retained conservatively;
+                # a name present on only one side is a renamed/added/deleted
+                # local sheet and therefore cannot be mapped safely.
+                if folded_name in other_sheets:
+                    return None
+                return None
+            target = contexts.get(sheet.name.casefold())
+            if target is None:
+                return None
+
+        if not target.is_mappable:
+            return None
+        assert target.row_mapping is not None
+        assert target.column_mapping is not None
+        if side == "SENT":
+            logical_row = row
+            logical_col = col
+            if row is not None and row not in target.row_mapping:
+                return None
+            if col is not None and col not in target.column_mapping:
+                return None
+        else:
+            assert target.reverse_row_mapping is not None
+            assert target.reverse_column_mapping is not None
+            if row is not None and row not in target.reverse_row_mapping:
+                return None
+            if col is not None and col not in target.reverse_column_mapping:
+                return None
+            logical_row = (
+                target.reverse_row_mapping.get(row) if row is not None else None
+            )
+            logical_col = (
+                target.reverse_column_mapping.get(col) if col is not None else None
+            )
+        return f"SHEET:{target.sent.name.casefold()}", logical_row, logical_col
+
+    return resolve
+
+
+def _formula_is_fundamentally_changed(
+    sent_cell: CellSnapshot,
+    received_cell: CellSnapshot,
+    sent_resolver,
+    received_resolver,
+) -> bool | None:
+    """Return True/False, or None when identity cannot be certified safely."""
+
+    if sent_cell.formula_status not in {"RESOLVED", "RESOLVED_SHARED"}:
+        return None
+    if received_cell.formula_status not in {"RESOLVED", "RESOLVED_SHARED"}:
+        return None
+    if formula_has_ref_error(sent_cell.formula_text or sent_cell.formula_shape):
+        return None
+    if formula_has_ref_error(received_cell.formula_text or received_cell.formula_shape):
+        return None
+
+    sent_text = sent_cell.formula_text
+    received_text = received_cell.formula_text
+    if sent_text is not None and received_text is not None:
+        try:
+            sent_identity = canonicalize_formula(sent_text, sent_resolver)
+            received_identity = canonicalize_formula(received_text, received_resolver)
+            if sent_identity == received_identity:
+                return False
+            sent_dynamic = normalize_dynamic_array_identity(sent_identity)
+            received_dynamic = normalize_dynamic_array_identity(received_identity)
+            if sent_dynamic == received_dynamic:
+                # B4# and _xlfn.ANCHORARRAY(B4) are two exact OOXML
+                # serializations of the same dynamic-array spill reference.
+                return False
+            sent_neutral = neutralize_compatibility_identity(sent_dynamic)
+            received_neutral = neutralize_compatibility_identity(received_dynamic)
+            if sent_neutral == received_neutral:
+                # The syntax-only difference is not an anomaly, but implicit
+                # intersection can affect spill semantics, so do not certify it
+                # as identical without Excel's calculation engine.
+                return None
+            if (
+                formula_compatibility_signature(sent_text)
+                != formula_compatibility_signature(received_text)
+                and (
+                    formula_uses_single_compatibility(sent_text)
+                    or formula_uses_single_compatibility(received_text)
+                )
+            ):
+                return None
+            return True
+        except (FormulaComparisonUnresolved, ValueError):
+            # Unsupported or only partially parsed reference syntax stays
+            # unresolved. A target-agnostic fallback here could turn a lexical
+            # parser limitation into a false manual-change allegation.
+            return None
+
+    # Shared followers have no fabricated A1 formula text and are compared via
+    # their validated group masters by the caller. Other textless formula
+    # records (notably data tables) cannot certify expression identity.
+    return None
+
+
+def _cell_change_evidence(
+    sheet_name: str,
+    sent_cell: CellSnapshot,
+    received_cell: CellSnapshot | None,
+    received_coordinate: str,
+) -> str:
+    return (
+        f"{sheet_name}!{sent_cell.coordinate} -> {sheet_name}!{received_coordinate} | "
+        f"sent {_cell_description(sent_cell)} | received {_cell_description(received_cell)}"
+    )
+
+
+def _cell_finding(
+    counter: list[int],
+    context: _CellComparisonContext,
+    code: str,
+    changes: list[tuple[CellSnapshot, CellSnapshot | None, str]],
+) -> Finding:
+    labels = {
+        "FORMULA_REPLACED_WITH_VALUE": (
+            "FORMULA_INTEGRITY",
+            "formula cell(s) from the sent template were replaced with hardcoded values",
+        ),
+        "FORMULA_REMOVED": (
+            "FORMULA_INTEGRITY",
+            "formula cell(s) from the sent template are blank in the received workbook",
+        ),
+        "FORMULA_MODIFIED": (
+            "FORMULA_INTEGRITY",
+            "formula cell(s) were fundamentally modified",
+        ),
+        "PREFILLED_VALUE_CHANGED": (
+            "VALUE_INTEGRITY",
+            "meaningful prefilled value(s) from the sent template were changed",
+        ),
+    }
+    category, wording = labels[code]
+    evidence = [
+        _cell_change_evidence(
+            context.sent.name,
+            sent_cell,
+            received_cell,
+            received_coordinate,
+        )
+        for sent_cell, received_cell, received_coordinate in changes[
+            :_CELL_FINDING_EVIDENCE_LIMIT
+        ]
+    ]
+    if len(changes) > _CELL_FINDING_EVIDENCE_LIMIT:
+        evidence.append(
+            f"{len(changes) - _CELL_FINDING_EVIDENCE_LIMIT} additional changed cell(s) omitted."
+        )
+    return Finding(
+        id=_finding_id(counter),
+        category=category,
+        code=code,
+        severity="MEDIUM",
+        confidence="HIGH",
+        scope="SHEET",
+        message=f"{len(changes)} {wording} in sheet {context.sent.name!r}.",
+        sent_sheet_name=context.sent.name,
+        received_sheet_name=context.received.name,
+        unit_count=len(changes),
+        evidence=evidence,
+    )
+
+
+def _shared_formula_masters(sheet: SheetStructure) -> dict[str, CellSnapshot]:
+    grouped: dict[str, list[CellSnapshot]] = {}
+    for cell in sheet.material_cells:
+        if (
+            cell.has_formula
+            and (cell.formula_type or "").casefold() == "shared"
+            and cell.formula_group
+            and cell.formula_text is not None
+        ):
+            grouped.setdefault(cell.formula_group, []).append(cell)
+    return {
+        group: cells[0]
+        for group, cells in grouped.items()
+        if len(cells) == 1
+    }
+
+
+def _shared_group_change(
+    sent_cell: CellSnapshot,
+    received_cell: CellSnapshot,
+    context: _CellComparisonContext,
+    sent_masters: dict[str, CellSnapshot],
+    received_masters: dict[str, CellSnapshot],
+    sent_resolver,
+    received_resolver,
+) -> bool | None:
+    sent_group = sent_cell.formula_group
+    received_group = received_cell.formula_group
+    if not sent_group or not received_group:
+        return None
+    sent_master = sent_masters.get(sent_group)
+    received_master = received_masters.get(received_group)
+    if sent_master is None or received_master is None:
+        return None
+    assert context.row_mapping is not None
+    assert context.column_mapping is not None
+    # Comparing explicit masters is safe only when they represent the same
+    # logical group coordinate. Otherwise Excel may simply have selected a
+    # different master cell while preserving the shared expression pattern.
+    if (
+        context.row_mapping.get(sent_master.row) != received_master.row
+        or context.column_mapping.get(sent_master.col) != received_master.col
+    ):
+        return None
+    return _formula_is_fundamentally_changed(
+        sent_master,
+        received_master,
+        sent_resolver,
+        received_resolver,
+    )
+
+
+def _shared_follower_to_explicit_change(
+    sent_cell: CellSnapshot,
+    received_cell: CellSnapshot,
+    sent_masters: dict[str, CellSnapshot],
+    sent_resolver,
+    received_resolver,
+) -> bool | None:
+    """Compare a split shared follower without inventing its A1 formula text."""
+
+    if not sent_cell.formula_group or received_cell.formula_text is None:
+        return None
+    sent_master = sent_masters.get(sent_cell.formula_group)
+    if sent_master is None or sent_master.formula_text is None:
+        return None
+    if formula_has_ref_error(sent_master.formula_text) or formula_has_ref_error(
+        received_cell.formula_text
+    ):
+        return None
+    if formula_compatibility_signature(
+        sent_master.formula_text
+    ) != formula_compatibility_signature(received_cell.formula_text):
+        return None
+    try:
+        sent_identity = canonicalize_formula(sent_master.formula_text, sent_resolver)
+        received_identity = canonicalize_formula(
+            received_cell.formula_text,
+            received_resolver,
+        )
+    except (FormulaComparisonUnresolved, ValueError):
+        return None
+    sent_skeleton = reference_agnostic_shape(
+        neutralize_compatibility_identity(
+            normalize_dynamic_array_identity(sent_identity)
+        )
+    )
+    received_skeleton = reference_agnostic_shape(
+        neutralize_compatibility_identity(
+            normalize_dynamic_array_identity(received_identity)
+        )
+    )
+    if sent_skeleton is None or received_skeleton is None:
+        return None
+    return sent_skeleton != received_skeleton
+
+
+def _compare_cell_integrity(
+    counter: list[int],
+    context: _CellComparisonContext,
+    contexts: dict[str, _CellComparisonContext],
+    sent_sheets: dict[str, SheetStructure],
+    received_sheets: dict[str, SheetStructure],
+) -> list[Finding]:
+    """Compare only validated logical sent cells, never raw physical positions."""
+
+    sent_formula_cells = [cell for cell in context.sent.material_cells if cell.has_formula]
+    dedicated_kpi_coordinates = (
+        _kpi_identity_coordinates(context.sent)
+        if _is_kpi_sheet(context.sent.name)
+        else set()
+    )
+    sent_value_cells = _protected_prefilled_cells(
+        context.sent,
+        dedicated_kpi_coordinates,
+    )
+    if not context.is_mappable:
+        context.comparison.formula_unresolved_count = len(sent_formula_cells)
+        context.comparison.value_unresolved_count = len(sent_value_cells)
+        return []
+
+    assert context.row_mapping is not None
+    assert context.column_mapping is not None
+    received_cells = {
+        (cell.row, cell.col): cell for cell in context.received.material_cells
+    }
+    sent_resolver = _formula_reference_resolver(
+        side="SENT",
+        current=context,
+        contexts=contexts,
+        sent_sheets=sent_sheets,
+        received_sheets=received_sheets,
+    )
+    received_resolver = _formula_reference_resolver(
+        side="RECEIVED",
+        current=context,
+        contexts=contexts,
+        sent_sheets=sent_sheets,
+        received_sheets=received_sheets,
+    )
+    sent_shared_masters = _shared_formula_masters(context.sent)
+    received_shared_masters = _shared_formula_masters(context.received)
+    shared_outcomes: dict[tuple[str, str], bool | None] = {}
+    changes: dict[str, list[tuple[CellSnapshot, CellSnapshot | None, str]]] = {
+        "FORMULA_REPLACED_WITH_VALUE": [],
+        "FORMULA_REMOVED": [],
+        "FORMULA_MODIFIED": [],
+        "PREFILLED_VALUE_CHANGED": [],
+    }
+
+    for sent_cell in sent_formula_cells:
+        received_row = context.row_mapping.get(sent_cell.row)
+        received_col = context.column_mapping.get(sent_cell.col)
+        if received_row is None or received_col is None:
+            context.comparison.formula_unresolved_count += 1
+            continue
+        received_coordinate = _cell_coordinate(received_row, received_col)
+        received_cell = received_cells.get((received_row, received_col))
+        if received_cell is None:
+            changes["FORMULA_REMOVED"].append(
+                (sent_cell, None, received_coordinate)
+            )
+            continue
+        if not received_cell.has_formula:
+            changes["FORMULA_REPLACED_WITH_VALUE"].append(
+                (sent_cell, received_cell, received_coordinate)
+            )
+            continue
+        if sent_cell.formula_status not in {"RESOLVED", "RESOLVED_SHARED"}:
+            context.comparison.formula_unresolved_count += 1
+            continue
+        if received_cell.formula_status not in {"RESOLVED", "RESOLVED_SHARED"}:
+            context.comparison.formula_unresolved_count += 1
+            continue
+        sent_is_shared = (sent_cell.formula_type or "").casefold() == "shared"
+        received_is_shared = (
+            received_cell.formula_type or ""
+        ).casefold() == "shared"
+        if sent_is_shared and received_is_shared:
+            group_key = (
+                sent_cell.formula_group or "",
+                received_cell.formula_group or "",
+            )
+            if group_key not in shared_outcomes:
+                shared_outcomes[group_key] = _shared_group_change(
+                    sent_cell,
+                    received_cell,
+                    context,
+                    sent_shared_masters,
+                    received_shared_masters,
+                    sent_resolver,
+                    received_resolver,
+                )
+            changed = shared_outcomes[group_key]
+        elif (
+            sent_is_shared
+            and sent_cell.formula_text is None
+            and received_cell.formula_text is not None
+        ):
+            changed = _shared_follower_to_explicit_change(
+                sent_cell,
+                received_cell,
+                sent_shared_masters,
+                sent_resolver,
+                received_resolver,
+            )
+        else:
+            changed = _formula_is_fundamentally_changed(
+                sent_cell,
+                received_cell,
+                sent_resolver,
+                received_resolver,
+            )
+        if changed is None:
+            context.comparison.formula_unresolved_count += 1
+        elif changed:
+            changes["FORMULA_MODIFIED"].append(
+                (sent_cell, received_cell, received_coordinate)
+            )
+
+    for sent_cell in sent_value_cells:
+        received_row = context.row_mapping.get(sent_cell.row)
+        received_col = context.column_mapping.get(sent_cell.col)
+        if received_row is None or received_col is None:
+            context.comparison.value_unresolved_count += 1
+            continue
+        received_coordinate = _cell_coordinate(received_row, received_col)
+        received_cell = received_cells.get((received_row, received_col))
+        unchanged = (
+            received_cell is not None
+            and not received_cell.has_formula
+            and received_cell.comparison_key is not None
+            and received_cell.comparison_key == sent_cell.comparison_key
+        )
+        if not unchanged:
+            changes["PREFILLED_VALUE_CHANGED"].append(
+                (sent_cell, received_cell, received_coordinate)
+            )
+
+    context.comparison.formula_changed_count = sum(
+        len(changes[code])
+        for code in (
+            "FORMULA_REPLACED_WITH_VALUE",
+            "FORMULA_REMOVED",
+            "FORMULA_MODIFIED",
+        )
+    )
+    context.comparison.value_changed_count = len(
+        changes["PREFILLED_VALUE_CHANGED"]
+    )
+    return [
+        _cell_finding(counter, context, code, code_changes)
+        for code, code_changes in changes.items()
+        if code_changes
+    ]
 
 
 def _compare_workbooks(
@@ -474,6 +1171,7 @@ def _compare_workbooks(
     comparisons: list[SheetComparison] = []
     warnings = [*sent.warnings, *received.warnings]
     counter = [0]
+    cell_contexts: dict[str, _CellComparisonContext] = {}
 
     for sheet in sent.sheets:
         if sheet.name in received_by_name:
@@ -491,6 +1189,9 @@ def _compare_workbooks(
             evidence=[f"Sent sheet position: {sheet.index}.", "No exact sheet-name match exists in received."],
         )
         findings.append(finding)
+        dedicated_kpi_coordinates = (
+            _kpi_identity_coordinates(sheet) if _is_kpi_sheet(sheet.name) else set()
+        )
         comparisons.append(
             SheetComparison(
                 status="DELETED",
@@ -502,6 +1203,12 @@ def _compare_workbooks(
                 received_type=None,
                 sent_metrics=sheet.metrics,
                 received_metrics=None,
+                formula_unresolved_count=sum(
+                    cell.has_formula for cell in sheet.material_cells
+                ),
+                value_unresolved_count=len(
+                    _protected_prefilled_cells(sheet, dedicated_kpi_coordinates)
+                ),
                 anomaly_ids=[finding.id],
             )
         )
@@ -574,6 +1281,21 @@ def _compare_workbooks(
             findings.append(finding)
             comparison.status = "MODIFIED"
             comparison.anomaly_ids.append(finding.id)
+            if sent_sheet.sheet_type == "worksheet":
+                dedicated_kpi_coordinates = (
+                    _kpi_identity_coordinates(sent_sheet)
+                    if _is_kpi_sheet(sent_sheet.name)
+                    else set()
+                )
+                comparison.formula_unresolved_count = sum(
+                    cell.has_formula for cell in sent_sheet.material_cells
+                )
+                comparison.value_unresolved_count = len(
+                    _protected_prefilled_cells(
+                        sent_sheet,
+                        dedicated_kpi_coordinates,
+                    )
+                )
             comparisons.append(comparison)
             continue
         if sent_sheet.sheet_type != "worksheet":
@@ -582,6 +1304,7 @@ def _compare_workbooks(
 
         row_alignment = None
         column_alignment = None
+        grid_validation_notes: list[str] = []
         unresolved_reasons: list[str] = []
         try:
             row_alignment = align_axis(sent_sheet.rows, received_sheet.rows, "ROW", config)
@@ -596,14 +1319,13 @@ def _compare_workbooks(
 
         if row_alignment is not None and column_alignment is not None:
             try:
-                comparison.alignment_notes.extend(
-                    validate_separable_grid(
-                        sent_sheet,
-                        received_sheet,
-                        row_alignment,
-                        column_alignment,
-                    )
+                grid_validation_notes = validate_separable_grid(
+                    sent_sheet,
+                    received_sheet,
+                    row_alignment,
+                    column_alignment,
                 )
+                comparison.alignment_notes.extend(grid_validation_notes)
             except AlignmentUnresolved as exc:
                 unresolved_reasons.append(str(exc))
                 row_alignment = None
@@ -656,6 +1378,42 @@ def _compare_workbooks(
             comparison.anomaly_ids.append(finding.id)
             comparison.alignment_notes.extend(unresolved_reasons)
 
+        structural_operations = (
+            list(row_alignment.operations) if row_alignment is not None else []
+        ) + (
+            list(column_alignment.operations) if column_alignment is not None else []
+        )
+        content_mapping_trusted = (
+            row_alignment is not None
+            and column_alignment is not None
+            and not (
+                structural_operations
+                and (
+                    any(
+                        operation.confidence.upper() == "LOW"
+                        for operation in structural_operations
+                    )
+                    or any(
+                        note.startswith("Fewer than three unique cell anchors")
+                        for note in grid_validation_notes
+                    )
+                )
+            )
+        )
+        if row_alignment is not None and column_alignment is not None and not content_mapping_trusted:
+            comparison.alignment_notes.append(
+                "Formula and prefilled-value comparison was skipped because a structural edit lacks enough high-confidence positional evidence."
+            )
+        cell_contexts[sent_sheet.name.casefold()] = _CellComparisonContext(
+            sent=sent_sheet,
+            received=received_sheet,
+            comparison=comparison,
+            row_mapping=(row_alignment.mapping if content_mapping_trusted else None),
+            column_mapping=(
+                column_alignment.mapping if content_mapping_trusted else None
+            ),
+        )
+
         if _is_kpi_sheet(sent_sheet.name):
             kpi_comparison, kpi_findings = _compare_kpi_snapshots(
                 counter,
@@ -675,6 +1433,24 @@ def _compare_workbooks(
         if comparison.anomaly_ids:
             comparison.status = "MODIFIED"
         comparisons.append(comparison)
+
+    # Formula references can cross sheet boundaries, so semantic comparisons
+    # start only after every exact-name worksheet pair has a validated mapping.
+    sent_casefold = _casefold_sheet_lookup(sent)
+    received_casefold = _casefold_sheet_lookup(received)
+    for context in cell_contexts.values():
+        cell_findings = _compare_cell_integrity(
+            counter,
+            context,
+            cell_contexts,
+            sent_casefold,
+            received_casefold,
+        )
+        for finding in cell_findings:
+            findings.append(finding)
+            context.comparison.anomaly_ids.append(finding.id)
+        if cell_findings:
+            context.comparison.status = "MODIFIED"
 
     comparisons.sort(
         key=lambda item: (
@@ -750,6 +1526,18 @@ def _metrics(
         kpi_unexpected_count=sum(
             comparison.unexpected_count for comparison in kpi_comparisons
         ),
+        formula_changed_count=sum(
+            comparison.formula_changed_count for comparison in comparisons
+        ),
+        formula_unresolved_count=sum(
+            comparison.formula_unresolved_count for comparison in comparisons
+        ),
+        value_changed_count=sum(
+            comparison.value_changed_count for comparison in comparisons
+        ),
+        value_unresolved_count=sum(
+            comparison.value_unresolved_count for comparison in comparisons
+        ),
         sheet_names_match=(
             {sheet.name for sheet in sent_workbook.sheets}
             == {sheet.name for sheet in received_workbook.sheets}
@@ -766,8 +1554,12 @@ def _paired_result(
 ) -> CountryResult:
     display_name = sent_path.stem
     country_id = _slug(display_name, key)
-    sent_evidence = _file_evidence(sent_path, "sent")
-    received_evidence = _file_evidence(received_path, "received")
+    sent_evidence = _file_evidence(sent_path, "sent", config.sent_dir)
+    received_evidence = _file_evidence(
+        received_path,
+        "received",
+        config.received_dir,
+    )
     try:
         sent_workbook = read_workbook(sent_path, config)
         received_workbook = read_workbook(received_path, config)
@@ -811,7 +1603,12 @@ def _paired_result(
         )
 
 
-def _unpaired_result(key: str, path: Path, state: str) -> CountryResult:
+def _unpaired_result(
+    key: str,
+    path: Path,
+    state: str,
+    config: AnalysisConfig,
+) -> CountryResult:
     display_name = path.stem
     country_id = _slug(display_name, f"{state}:{key}")
     missing_received = state == "MISSING_RECEIVED"
@@ -827,8 +1624,16 @@ def _unpaired_result(key: str, path: Path, state: str) -> CountryResult:
         overall_status="ERROR",
         comparison_state=state,
         max_anomaly_severity=None,
-        sent_file=_file_evidence(path, "sent") if missing_received else None,
-        received_file=None if missing_received else _file_evidence(path, "received"),
+        sent_file=(
+            _file_evidence(path, "sent", config.sent_dir)
+            if missing_received
+            else None
+        ),
+        received_file=(
+            None
+            if missing_received
+            else _file_evidence(path, "received", config.received_dir)
+        ),
         errors=[error],
     )
 
@@ -856,9 +1661,18 @@ def analyze_directories(config: AnalysisConfig | None = None) -> RunResult:
         if sent_path and received_path:
             countries.append(_paired_result(key, sent_path, received_path, resolved))
         elif sent_path:
-            countries.append(_unpaired_result(key, sent_path, "MISSING_RECEIVED"))
+            countries.append(
+                _unpaired_result(key, sent_path, "MISSING_RECEIVED", resolved)
+            )
         elif received_path:
-            countries.append(_unpaired_result(key, received_path, "UNEXPECTED_RECEIVED"))
+            countries.append(
+                _unpaired_result(
+                    key,
+                    received_path,
+                    "UNEXPECTED_RECEIVED",
+                    resolved,
+                )
+            )
 
     countries.sort(key=lambda item: (item.overall_status != "ERROR", item.display_name.casefold()))
     summary = RunSummary(
@@ -885,11 +1699,19 @@ def analyze_directories(config: AnalysisConfig | None = None) -> RunResult:
     now = datetime.now(UTC)
     run_id = now.strftime("%Y%m%dT%H%M%SZ")
     return RunResult(
-        schema_version="1.1",
+        schema_version="1.2",
         run_id=run_id,
         generated_at_utc=now.isoformat().replace("+00:00", "Z"),
         comparator_version=__version__,
-        scope=["SHEETS", "ROWS", "COLUMNS", "KPI_IDENTIFIERS", "REFERENCE_ERRORS"],
+        scope=[
+            "SHEETS",
+            "ROWS",
+            "COLUMNS",
+            "KPI_IDENTIFIERS",
+            "REFERENCE_ERRORS",
+            "FORMULAS",
+            "PREFILLED_VALUES",
+        ],
         sent_directory=display_directory(source_config.sent_dir),
         received_directory=display_directory(source_config.received_dir),
         summary=summary,

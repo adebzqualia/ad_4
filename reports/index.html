@@ -119,7 +119,7 @@ thead th { color: #344054; background: #f9fafb; border-top: 0; font-size: .78rem
 tbody th { font-weight: 700; }
 tbody tr:hover { background: #fcfcfd; }
 .global-table { min-width: 1080px; }
-.sheet-table { min-width: 1280px; }
+.sheet-table { min-width: 1440px; }
 .cell-title { font-weight: 700; }
 .cell-meta, .muted { color: var(--subtle); font-size: .84rem; }
 .cell-meta { margin-top: .18rem; }
@@ -165,6 +165,16 @@ progress { width: 100%; height: .75rem; accent-color: var(--accent); }
 .mini-dl dt, .audit-dl dt { color: var(--muted); font-weight: 650; }
 .mini-dl dd, .audit-dl dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 .evidence-list, .notes-list { margin: .45rem 0 0; padding-left: 1.2rem; }
+.finding[data-category="FORMULA_INTEGRITY"] .evidence-list,
+.finding[data-category="VALUE_INTEGRITY"] .evidence-list {
+  display: grid; gap: .35rem; padding-left: 0; list-style: none;
+  font: .82rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.finding[data-category="FORMULA_INTEGRITY"] .evidence-list li,
+.finding[data-category="VALUE_INTEGRITY"] .evidence-list li {
+  padding: .45rem .55rem; overflow-wrap: anywhere; white-space: pre-wrap;
+  border: 1px solid var(--line-soft); border-radius: .35rem; background: #f9fafb;
+}
 details { margin-top: .55rem; }
 summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700; }
 .sheet-evidence-row > td { padding: .35rem .8rem .8rem; background: #fcfcfd; }
@@ -174,6 +184,10 @@ summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700;
 .sheet-evidence .mini-dl dd { overflow-wrap: break-word; word-break: normal; }
 .reference-errors { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .reference-errors--present { color: var(--error); font-weight: 700; }
+.cell-integrity { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.cell-integrity .cell-meta { white-space: normal; }
+.cell-integrity__item { display: block; }
+.cell-integrity__item--changed { color: var(--warn); font-weight: 700; }
 .sheet-inventory { padding: 0; }
 .sheet-inventory > summary { width: 100%; padding: 1rem; }
 .sheet-inventory[open] > summary { border-bottom: 1px solid var(--line-soft); }
@@ -257,7 +271,7 @@ summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700;
     <div>
       <p class="eyebrow">Workbook integrity</p>
       <h1>POPS global report</h1>
-      <p class="lede">Comparison of 0 sent and 0 received workbooks. This run evaluates sheets, rows, columns, KPI identifiers, #REF! reference errors where stored workbook evidence is available.</p>
+      <p class="lede">Comparison of 0 sent and 0 received workbooks. This run evaluates sheets, rows, columns, KPI identifiers, #REF! reference errors, aligned formulas, aligned prefilled values where stored workbook evidence is available.</p>
     </div>
     <div class="hero__status" aria-label="Run status">
       <span class="badge badge--ok"><span aria-hidden="true">✓</span>OK</span>
@@ -275,6 +289,8 @@ summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700;
       <article class="card kpi"><div class="kpi__label">ERROR</div><div class="kpi__value">0</div><div class="kpi__help">Workbooks requiring action</div></article>
       <article class="card kpi"><div class="kpi__label">HIGH findings</div><div class="kpi__value">0</div><div class="kpi__help">Across 0 countries</div></article>
       <article class="card kpi"><div class="kpi__label">MEDIUM findings</div><div class="kpi__value">0</div><div class="kpi__help">Review recommended</div></article>
+      <article class="card kpi"><div class="kpi__label">Formula changes</div><div class="kpi__value">0</div><div class="kpi__help">0 unresolved or skipped</div></article>
+      <article class="card kpi"><div class="kpi__label">Prefilled value changes</div><div class="kpi__value">0</div><div class="kpi__help">0 unresolved or skipped</div></article>
     </div>
   </section>
   <section class="section" aria-labelledby="coverage-heading">
@@ -294,7 +310,7 @@ summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700;
   </section>
   <section class="section" aria-labelledby="rollup-heading">
     <div class="section__heading"><h2 id="rollup-heading">Anomalies by category and type</h2></div>
-    <p class="section-intro">Structural additions and deletions are counted independently. KPI and formula-integrity findings are reported separately with their own criticality.</p>
+    <p class="section-intro">Structural additions and deletions are counted independently. KPI, formula, and prefilled-value findings are reported in separate integrity categories with their own criticality.</p>
     <div class="notice notice--ok"><p class="notice__title">No anomaly findings</p><p>No anomalies were detected in the comparable workbooks.</p></div>
   </section>
   <section class="section" aria-labelledby="countries-heading">
@@ -319,21 +335,23 @@ summary { width: fit-content; color: #344054; cursor: pointer; font-weight: 700;
       <ul class="method-list">
         <li>Sheet identity is matched by exact Excel sheet name. A rename is reported conservatively as one deleted sheet and one added sheet.</li>
         <li>Active worksheet extents are derived from stored cells and structural evidence such as row or column properties, ranges, tables, and drawing anchors. Excel's declared dimension is retained as diagnostic evidence rather than trusted on its own.</li>
-        <li>Inserted and deleted rows and columns are inferred by aligning structural signatures. Ambiguous mappings are surfaced as a HIGH manual-review finding instead of being silently treated as unchanged.</li>
+        <li>Inserted and deleted rows and columns are inferred by aligning structural signatures. Recalculated array/data-table outputs and refresh-driven PivotTable/query-table cells and ranges are excluded from those signatures. Ambiguous mappings are surfaced as a HIGH manual-review finding instead of being silently treated as unchanged.</li>
         <li>Operation counts, not net deltas, determine structural status. Equal additions and deletions may leave the same final dimensions.</li>
         <li>The KPI sheet is checked for an identifiable KPI column and differences in normalized KPI identifiers and order.</li>
-        <li>#REF! counts include formula text and cached error cells; per-sheet evidence shows both components, which can overlap in the same cell.</li>
-        <li>Other changed values, formatting intent, charts, and broader business-rule validation remain outside this report's scope.</li>
+        <li>#REF! counts include formula text and cached error cells; per-sheet evidence shows both components, which can overlap. Only an increase in explicit formula tokens creates a HIGH finding because an unchanged formula's cache may be recalculated by Excel.</li>
+        <li>Formulas are compared only after logical row and column alignment. Stored cached results are ignored; formulas inside removed axes or sheets with unresolved mappings are skipped rather than compared at the wrong coordinates.</li>
+        <li>Meaningful prefilled sent values are compared at logically aligned cells. Blank, zero, and lone-hyphen placeholders, plus stored array-formula, data-table, PivotTable, query-table, and calculated-column/total outputs, are excluded. Cells inside removed axes or unresolved mappings are skipped and counted separately.</li>
+        <li>Formatting intent, charts, and broader business-rule validation remain outside this report's scope.</li>
       </ul>
     </div>
   </section>
   <section class="section" aria-labelledby="audit-heading">
     <div class="section__heading"><h2 id="audit-heading">Run evidence</h2></div>
-    <div class="card"><dl class="audit-dl"><dt>Run ID</dt><dd><code>20260817T131507Z</code></dd><dt>Generated</dt><dd><time datetime="2026-08-17T13:15:07.301655Z">2026-08-17T13:15:07.301655Z</time></dd><dt>Comparator</dt><dd>0.2.0</dd><dt>Schema</dt><dd>1.1</dd><dt>Scope</dt><dd>SHEETS, ROWS, COLUMNS, KPI_IDENTIFIERS, REFERENCE_ERRORS</dd><dt>Sent directory</dt><dd><code>data/sent</code></dd><dt>Received directory</dt><dd><code>data/received</code></dd></dl></div>
+    <div class="card"><dl class="audit-dl"><dt>Run ID</dt><dd><code>20260817T155918Z</code></dd><dt>Generated</dt><dd><time datetime="2026-08-17T15:59:18.922980Z">2026-08-17T15:59:18.922980Z</time></dd><dt>Comparator</dt><dd>0.3.0</dd><dt>Schema</dt><dd>1.2</dd><dt>Scope</dt><dd>SHEETS, ROWS, COLUMNS, KPI_IDENTIFIERS, REFERENCE_ERRORS, FORMULAS, PREFILLED_VALUES</dd><dt>Sent directory</dt><dd><code>data/sent</code></dd><dt>Received directory</dt><dd><code>data/received</code></dd></dl></div>
   </section>
-  <p class="print-only">Run 20260817T131507Z · generated 2026-08-17T13:15:07.301655Z</p>
+  <p class="print-only">Run 20260817T155918Z · generated 2026-08-17T15:59:18.922980Z</p>
 </main>
-<footer class="footer"><div class="footer__inner">POPS anomaly detector · Run <code>20260817T131507Z</code> · Generated <time datetime="2026-08-17T13:15:07.301655Z">2026-08-17T13:15:07.301655Z</time></div></footer>
+<footer class="footer"><div class="footer__inner">POPS anomaly detector · Run <code>20260817T155918Z</code> · Generated <time datetime="2026-08-17T15:59:18.922980Z">2026-08-17T15:59:18.922980Z</time></div></footer>
 
 <script>
 (() => {
